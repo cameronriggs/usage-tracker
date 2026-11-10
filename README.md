@@ -1,7 +1,8 @@
 # Usage Tracker
 
 A tiny Windows widget that shows the 5-hour and weekly usage limits for your AI
-agents. One 150 KB exe, about 10 MB of RAM, no installs.
+agents. One 170 KB exe, about 10 MB of RAM, no installs. It can float on the
+desktop (wide or narrow) or sit inside the taskbar of any display.
 
 ```text
 ▌Claude    5h ██░░░░░░░░│░░░   7%  3h 21m
@@ -35,6 +36,7 @@ Claude, and the Codex CLI or VS Code extension for Codex.
 - **Right-click** (the widget or the tray icon) for:
   - Hide / Show
   - Refresh now
+  - Layout: Wide, Narrow (vertical), or In the taskbar (one entry per display)
   - Always on top
   - Show reset times
   - Size: Small, Normal, Large, Extra large
@@ -46,16 +48,46 @@ Claude, and the Codex CLI or VS Code extension for Codex.
 - **Hover** a provider for details: exact reset time, how much of the window has
   passed, when it last updated, and any error.
 
-How to read a bar:
+### Layouts
+
+| Layout | Shape | Good for |
+| --- | --- | --- |
+| Wide | One row per limit, providers stacked (about 290 x 95) | A corner of the desktop |
+| Narrow | A thin column, each limit a text line over a full-width bar (about 108 px wide) | The gap beside a browser or the desktop icons |
+| In the taskbar | Providers side by side, two rows high, transparent background | A taskbar with spare room, like a second monitor's |
+
+Wide and Narrow remember their own positions, so switching back and forth
+doesn't lose either one.
+
+In the taskbar:
+
+- It sits just left of the tray or clock on the display you pick. **Drag it to
+  slide it along the taskbar**; that spot is remembered.
+- Text is dark or light to match the taskbar (follows Windows' light/dark mode).
+- It stays above the taskbar after you click the taskbar, and hides while a
+  full-screen app or video is on that display.
+- If that display has no taskbar (unplugged, or the taskbar auto-hides), it
+  floats as a Wide window until the taskbar is back.
+
+### How to read a bar
 
 - Fill is the share of the limit used. Blue under 70%, amber 70 to 89%, red 90%+.
-- The thin white tick is how much of the window's *time* has passed. Fill past
-  the tick means you're burning faster than the limit allows on average.
+- The thin tick is how much of the window's *time* has passed. Fill past the
+  tick means you're burning faster than the limit allows on average.
 - The right column counts down to the reset.
-- A dimmed provider with an amber dot is showing its last good numbers because
-  the latest refresh failed (hover to see why). A blue dot means it's refreshing.
+- An amber dot after a name means the last check failed and you're seeing the
+  previous numbers (hover to see why and when it retries). After 15 minutes
+  without fresh numbers, that provider is dimmed. A blue dot means it's checking.
 
-It refreshes every 3 minutes, right after a window resets, and after the PC wakes.
+### Refreshing
+
+Every 3 minutes (`refreshMinutes`), once right after a window resets, and
+shortly after the PC wakes. Claude is checked at most every 5 minutes, because
+Anthropic limits how often the usage endpoint can be called per account, and
+Claude Code's own usage display uses the same allowance. If Anthropic says
+"too many requests", the widget waits 5, 10, 20, then 30 minutes between tries
+(or longer if Anthropic asks). Running the widget on two PCs with the same
+Claude account doubles the calls.
 
 ## Providers (`config.json`)
 
@@ -113,7 +145,7 @@ Print `{"error": "message"}` to show a message instead.
 | --- | --- |
 | `UsageTracker.exe` | The app |
 | `config.json` | Your providers (hand-edited) |
-| `state.json` | Window position, size, opacity, on-top (written by the app) |
+| `state.json` | Layout, positions, size, opacity, on-top (written by the app) |
 | `error.log` | Only appears if something unexpected breaks |
 | `src/UsageTracker.cs` | All the source |
 | `build.ps1` | Rebuilds the exe with the C# compiler built into Windows |
@@ -126,5 +158,13 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
 Exit the widget first. Uses `csc.exe` from .NET Framework 4.8, so the source is
-C# 5. A hidden `--render out.png [--demo] [--scale 2]` switch draws the widget to
-an image, for checking layout changes without opening a window.
+C# 5. A hidden switch draws the widget to an image, for checking layout changes
+without opening a window:
+
+```text
+UsageTracker.exe --render out.png [--demo] [--scale 2] [--layout wide|narrow|strip]
+                 [--taskbar light|dark] [--height 48] [--no-resets]
+```
+
+Use `--demo` for repeated checks: without it, every render calls the providers,
+and a handful of Claude calls in a few minutes trips Anthropic's rate limit.

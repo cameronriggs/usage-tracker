@@ -10,6 +10,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -26,8 +27,8 @@ using Microsoft.Win32;
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 [assembly: AssemblyTitle("Usage Tracker")]
 [assembly: AssemblyProduct("Usage Tracker")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 namespace UsageTracker
 {
@@ -196,6 +197,11 @@ namespace UsageTracker
             return (int)t.TotalDays + "d " + t.Hours + "h";
         }
 
+        public static string Clock(DateTime utc)
+        {
+            return utc.ToLocalTime().ToString("h:mm tt", CultureInfo.CurrentCulture);
+        }
+
         public static string When(DateTime utc)
         {
             var local = utc.ToLocalTime();
@@ -209,7 +215,8 @@ namespace UsageTracker
     class HttpError : Exception
     {
         public readonly int Status;
-        public HttpError(int status) : base("HTTP " + status) { Status = status; }
+        public readonly TimeSpan? RetryAfter;
+        public HttpError(int status, TimeSpan? retryAfter) : base("HTTP " + status) { Status = status; RetryAfter = retryAfter; }
     }
 
     static class Http
@@ -220,7 +227,7 @@ namespace UsageTracker
             req.Method = "GET";
             req.Timeout = 15000;
             req.ReadWriteTimeout = 15000;
-            req.UserAgent = "UsageTracker/1.0";
+            req.UserAgent = "UsageTracker/1.1";
             req.Accept = "application/json";
             req.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
             if (headers != null) foreach (var kv in headers) req.Headers[kv.Key] = kv.Value;
@@ -233,10 +240,31 @@ namespace UsageTracker
             catch (WebException ex)
             {
                 var r = ex.Response as HttpWebResponse;
-                if (r != null) { int code = (int)r.StatusCode; r.Close(); throw new HttpError(code); }
+                if (r != null)
+                {
+                    int code = (int)r.StatusCode;
+                    var retry = ParseRetryAfter(r.Headers["Retry-After"]);
+                    r.Close();
+                    throw new HttpError(code, retry);
+                }
                 if (ex.Status == WebExceptionStatus.Timeout) throw new FetchException("Timed out reaching " + new Uri(url).Host);
                 throw new FetchException("Offline: can't reach " + new Uri(url).Host);
             }
+        }
+
+        static TimeSpan? ParseRetryAfter(string v)
+        {
+            if (string.IsNullOrEmpty(v)) return null;
+            int secs;
+            if (int.TryParse(v.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out secs) && secs >= 0)
+                return TimeSpan.FromSeconds(secs);
+            DateTime when;
+            if (DateTime.TryParse(v, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out when))
+            {
+                var d = when - DateTime.UtcNow;
+                if (d > TimeSpan.Zero) return d;
+            }
+            return null;
         }
     }
 
@@ -290,38 +318,63 @@ namespace UsageTracker
         public DateTime FetchedAt = DateTime.UtcNow;
     }
 
-    class FetchException : Exception { public FetchException(string m) : base(m) { } }
+    class FetchException : Exception
+    {
+        public bool RateLimited;
+        public TimeSpan? RetryAfter;
+        public FetchException(string m) : base(m) { }
+    }
 
     abstract class Provider
     {
         public string Name;
         public string Key;
         public Color Accent = Color.FromArgb(154, 160, 166);
+        // Some sources rate-limit hard; this is the shortest polling interval they get.
+        public virtual double MinIntervalMinutes { get { return 1; } }
         public abstract Snapshot Fetch();   // throws FetchException with a short, human message
     }
 
     class ProviderState
     {
+        // Data older than this is drawn dimmed when refreshing keeps failing.
+        public static readonly TimeSpan StaleAfter = TimeSpan.FromMinutes(15);
+
         public Provider P;
         public Snapshot Last;       // last good data, kept when a later refresh fails
         public string Error;        // last refresh error, null when the last refresh worked
         public bool Busy;
+        public int Failures;        // refreshes failed in a row
         public DateTime LastAttempt = DateTime.MinValue;
+        public DateTime NextDue = DateTime.MinValue;
+
+        public bool HasData { get { return Last != null && Last.Limits.Count > 0; } }
+        public bool Warning { get { return HasData && Error != null; } }
+        public bool Faded(DateTime now) { return Warning && now - Last.FetchedAt > StaleAfter; }
+    }
+
+    class FetchResult
+    {
+        public Snapshot Snap;
+        public string Error;
+        public bool RateLimited;
+        public TimeSpan? RetryAfter;
     }
 
     static class Fetcher
     {
-        public static void Run(Provider p, out Snapshot snap, out string err)
+        public static FetchResult Run(Provider p)
         {
-            snap = null; err = null;
+            var res = new FetchResult();
             try
             {
-                snap = p.Fetch();
-                snap.FetchedAt = DateTime.UtcNow;
-                snap.Limits.Sort((a, b) => a.WindowMinutes.CompareTo(b.WindowMinutes));
+                res.Snap = p.Fetch();
+                res.Snap.FetchedAt = DateTime.UtcNow;
+                res.Snap.Limits.Sort((a, b) => a.WindowMinutes.CompareTo(b.WindowMinutes));
             }
-            catch (FetchException fe) { err = fe.Message; }
-            catch (Exception ex) { err = ex.GetType().Name + ": " + ex.Message; Paths.Log(p.Name + ": " + ex); }
+            catch (FetchException fe) { res.Error = fe.Message; res.RateLimited = fe.RateLimited; res.RetryAfter = fe.RetryAfter; }
+            catch (Exception ex) { res.Error = ex.GetType().Name + ": " + ex.Message; Paths.Log(p.Name + ": " + ex); }
+            return res;
         }
     }
 
@@ -341,6 +394,9 @@ namespace UsageTracker
             credPath = credentials;
             Accent = Color.FromArgb(217, 119, 87);
         }
+
+        // Anthropic rate-limits this endpoint per account, and Claude Code polls it too.
+        public override double MinIntervalMinutes { get { return 5; } }
 
         string CredFile()
         {
@@ -370,7 +426,13 @@ namespace UsageTracker
             catch (HttpError e)
             {
                 if (e.Status == 401 || e.Status == 403) throw new FetchException(Expired);
-                if (e.Status == 429) throw new FetchException("Rate limited by Anthropic, retrying later");
+                if (e.Status == 429)
+                {
+                    var fe = new FetchException("Rate limited by Anthropic, retrying later");
+                    fe.RateLimited = true;
+                    fe.RetryAfter = e.RetryAfter;
+                    throw fe;
+                }
                 throw new FetchException("Anthropic API error " + e.Status);
             }
 
@@ -506,7 +568,7 @@ namespace UsageTracker
                     var w = p.StandardInput;
                     w.NewLine = "\n";
                     w.AutoFlush = true;
-                    w.WriteLine("{\"method\":\"initialize\",\"id\":1,\"params\":{\"clientInfo\":{\"name\":\"usage_tracker\",\"title\":\"Usage Tracker\",\"version\":\"1.0.0\"}}}");
+                    w.WriteLine("{\"method\":\"initialize\",\"id\":1,\"params\":{\"clientInfo\":{\"name\":\"usage_tracker\",\"title\":\"Usage Tracker\",\"version\":\"1.1.0\"}}}");
                     w.WriteLine("{\"method\":\"initialized\"}");
                     w.WriteLine("{\"method\":\"account/rateLimits/read\",\"id\":2}");
                     string line;
@@ -690,14 +752,29 @@ namespace UsageTracker
 
     public class AppState
     {
-        public int X { get; set; }
+        public string Layout { get; set; }        // "wide", "narrow" or "taskbar"
+        public int X { get; set; }                // wide window position
         public int Y { get; set; }
+        public int NX { get; set; }               // narrow window position
+        public int NY { get; set; }
+        public string DockScreen { get; set; }    // taskbar mode: display device name...
+        public string DockSide { get; set; }      // ...and its side ("main", "right", ...) as a fallback
+        public int DockGap { get; set; }          // taskbar mode: pixels from the taskbar's right end, -1 = default
         public bool OnTop { get; set; }
         public int Opacity { get; set; }
         public double UiScale { get; set; }
         public bool ShowResets { get; set; }
 
-        public AppState() { X = int.MinValue; Y = int.MinValue; OnTop = true; Opacity = 100; UiScale = 1.0; ShowResets = true; }
+        public AppState()
+        {
+            Layout = "wide";
+            X = Y = NX = NY = int.MinValue;
+            DockGap = -1;
+            OnTop = true;
+            Opacity = 100;
+            UiScale = 1.0;
+            ShowResets = true;
+        }
 
         public static AppState Load(string path)
         {
@@ -710,6 +787,7 @@ namespace UsageTracker
                     {
                         if (s.UiScale < 0.5 || s.UiScale > 3) s.UiScale = 1.0;
                         if (s.Opacity < 30 || s.Opacity > 100) s.Opacity = 100;
+                        if (s.Layout != "narrow" && s.Layout != "taskbar") s.Layout = "wide";
                         return s;
                     }
                 }
@@ -726,19 +804,12 @@ namespace UsageTracker
 
     // ------------------------------------------------------------------ drawing
 
+    enum ViewMode { Wide, Narrow, Strip }
+
     static class Theme
     {
         public static readonly Color Bg = Color.FromArgb(27, 29, 34);
         public static readonly Color Border = Color.FromArgb(58, 63, 71);
-        public static readonly Color Line = Color.FromArgb(44, 48, 56);
-        public static readonly Color Text = Color.FromArgb(230, 232, 235);
-        public static readonly Color Dim = Color.FromArgb(138, 144, 153);
-        public static readonly Color Track = Color.FromArgb(46, 50, 59);
-        public static readonly Color Ok = Color.FromArgb(90, 169, 230);
-        public static readonly Color Warn = Color.FromArgb(232, 176, 74);
-        public static readonly Color High = Color.FromArgb(229, 83, 75);
-
-        public static Color ForPercent(double p) { return p >= 90 ? High : p >= 70 ? Warn : Ok; }
 
         public static Color Mix(Color a, Color b, double t)
         {
@@ -748,8 +819,6 @@ namespace UsageTracker
                 (int)Math.Round(a.B + (b.B - a.B) * t));
         }
 
-        public static Color Fade(Color c, bool faded) { return faded ? Mix(c, Bg, 0.55) : c; }
-
         public static Color Parse(string hex, Color fallback)
         {
             try { if (!string.IsNullOrEmpty(hex)) return ColorTranslator.FromHtml(hex.Trim()); }
@@ -758,169 +827,412 @@ namespace UsageTracker
         }
     }
 
+    class Palette
+    {
+        public Color Bg, Text, Dim, Track, Line, Ok, Warn, High;
+        public bool Transparent;   // drawn with per-pixel alpha (taskbar mode), so GDI+ text
+
+        public static readonly Palette Dark = new Palette
+        {
+            Bg = Theme.Bg, Text = Color.FromArgb(230, 232, 235), Dim = Color.FromArgb(138, 144, 153),
+            Track = Color.FromArgb(46, 50, 59), Line = Color.FromArgb(44, 48, 56),
+            Ok = Color.FromArgb(90, 169, 230), Warn = Color.FromArgb(232, 176, 74), High = Color.FromArgb(229, 83, 75),
+        };
+
+        public static readonly Palette DarkTaskbar = new Palette
+        {
+            Transparent = true, Bg = Color.Transparent,
+            Text = Color.FromArgb(255, 255, 255), Dim = Color.FromArgb(196, 200, 206),
+            Track = Color.FromArgb(64, 255, 255, 255), Line = Color.FromArgb(56, 255, 255, 255),
+            Ok = Color.FromArgb(98, 180, 242), Warn = Color.FromArgb(242, 186, 84), High = Color.FromArgb(242, 100, 92),
+        };
+
+        public static readonly Palette LightTaskbar = new Palette
+        {
+            Transparent = true, Bg = Color.Transparent,
+            Text = Color.FromArgb(28, 28, 28), Dim = Color.FromArgb(88, 92, 98),
+            Track = Color.FromArgb(44, 0, 0, 0), Line = Color.FromArgb(48, 0, 0, 0),
+            Ok = Color.FromArgb(0, 108, 196), Warn = Color.FromArgb(184, 116, 0), High = Color.FromArgb(196, 43, 33),
+        };
+
+        public Color For(double p) { return p >= 90 ? High : p >= 70 ? Warn : Ok; }
+
+        public Color Fade(Color c, bool faded)
+        {
+            if (!faded) return c;
+            if (Transparent) return Color.FromArgb(Math.Min((int)c.A, 105), c);
+            return Theme.Mix(c, Bg, 0.55);
+        }
+    }
+
+    // Lays out and draws the providers in one of three shapes:
+    //   Wide:   providers stacked, each a name column plus one row per limit (the original look)
+    //   Narrow: providers stacked in a thin column, each limit a text line over a full-width bar
+    //   Strip:  providers side by side, two rows high, sized to fit inside the taskbar
     class Renderer : IDisposable
     {
         const TextFormatFlags TF = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine |
                                    TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix;
         readonly float S;
+        readonly ViewMode mode;
         readonly bool showResets;
+        readonly Palette pal;
+        readonly IList<ProviderState> items;
         readonly Font fName, fText, fSmall;
-        readonly int pad, rowH, blockGap, accentW, xName, nameW, xLabel, xBar, barW, barH, xPct, pctW, xReset, resetW, width;
+        readonly Bitmap measureBmp = new Bitmap(1, 1);
+        readonly Graphics measure;   // measuring through a DC is tight; the DC-less overload pads ~8 px
+        readonly List<Rectangle> blocks = new List<Rectangle>();
+        readonly int accentW, barH, labelW, pctW, resetW;
+        int pad, gap, rowH, barW, width, height;
+        int xName, nameColW, xLabel, xBar, xPct, xReset;       // wide
+        int nLeft, nContentW, nHeadH, nLineH, nBarRowH;         // narrow
+        int sTop;                                               // strip
+        readonly List<int> sNameW = new List<int>();
 
-        public Renderer(float scale, bool showResets, IList<ProviderState> items)
+        public Renderer(float scale, ViewMode mode, bool showResets, Palette pal, int stripHeight, IList<ProviderState> items)
         {
             S = scale;
+            this.mode = mode;
             this.showResets = showResets;
+            this.pal = pal;
+            this.items = items;
             fName = new Font("Segoe UI Semibold", 12f * S, FontStyle.Regular, GraphicsUnit.Pixel);
             fText = new Font("Segoe UI", 11.5f * S, FontStyle.Regular, GraphicsUnit.Pixel);
             fSmall = new Font("Segoe UI", 10.5f * S, FontStyle.Regular, GraphicsUnit.Pixel);
+            measure = Graphics.FromImage(measureBmp);
 
-            pad = P(9);
-            rowH = P(17);
-            blockGap = P(11);
             accentW = Math.Max(2, P(3));
-            barH = Math.Max(4, P(6));
-            xName = pad + accentW + P(7);
-
-            int nw = P(44), lw = W("wk", fText);
+            barH = Math.Max(4, P(mode == ViewMode.Wide ? 6 : 5));
+            // Countdown column: as wide as the longest countdown each window can show ("4h 59m", "6d 23h").
+            Font fr = mode == ViewMode.Narrow ? fSmall : fText;
+            int lw = W("wk", fText), rw = 0;
             foreach (var it in items)
-            {
-                nw = Math.Max(nw, W(it.P.Name, fName) + P(11));
                 if (it.Last != null)
-                {
-                    if (it.Last.Plan != null) nw = Math.Max(nw, W(it.Last.Plan, fSmall));
-                    foreach (var l in it.Last.Limits) lw = Math.Max(lw, W(l.Label, fText));
-                }
-            }
-            nameW = Math.Min(nw, P(130));
-            xLabel = xName + nameW + P(8);
-            xBar = xLabel + lw + P(7);
-            barW = P(104);
-            xPct = xBar + barW + P(7);
+                    foreach (var l in it.Last.Limits)
+                    {
+                        lw = Math.Max(lw, W(l.Label, fText));
+                        rw = Math.Max(rw, W(LongestCountdown(l.WindowMinutes), fr));
+                    }
+            labelW = lw;
             pctW = W("100%", fText);
-            xReset = xPct + pctW + P(10);
-            resetW = Math.Max(W("23h 59m", fText), W("6d 23h", fText));
-            width = (showResets ? xReset + resetW : xPct + pctW) + pad;
+            resetW = rw > 0 ? rw : W("6d 23h", fr);
+
+            if (mode == ViewMode.Narrow) LayoutNarrow();
+            else if (mode == ViewMode.Strip) LayoutStrip(stripHeight);
+            else LayoutWide();
         }
+
+        public Size Size { get { return new Size(width, height); } }
 
         int P(float v) { return (int)Math.Round(v * S); }
 
-        static int W(string s, Font f) { return TextRenderer.MeasureText(s ?? "", f, Size.Empty, TF).Width; }
-
-        static int RowsFor(ProviderState it)
+        // Measured with the same engine that draws: GDI for normal windows, GDI+ for the transparent strip.
+        int W(string s, Font f)
         {
-            return it.Last != null ? Math.Max(2, it.Last.Limits.Count) : 2;
-        }
-
-        public Size Measure(IList<ProviderState> items)
-        {
-            int h = pad * 2 - P(2);
-            for (int i = 0; i < items.Count; i++)
+            if (string.IsNullOrEmpty(s)) return 0;
+            if (pal.Transparent)
             {
-                if (i > 0) h += blockGap;
-                h += RowsFor(items[i]) * rowH;
+                measure.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                return (int)Math.Ceiling(measure.MeasureString(s, f, PointF.Empty, StringFormat.GenericTypographic).Width) + 2;
             }
-            return new Size(width, h);
+            return TextRenderer.MeasureText(measure, s, f, new Size(10000, 1000), TF).Width;
         }
 
-        public int HitTest(IList<ProviderState> items, int y)
+        static string LongestCountdown(double windowMinutes)
         {
-            int top = pad - P(1);
-            for (int i = 0; i < items.Count; i++)
+            if (windowMinutes <= 0) return "23h 59m";
+            return Fmt.Short(TimeSpan.FromMinutes(Math.Max(1, windowMinutes - 1)));
+        }
+
+        static int LimitCount(ProviderState it) { return it.HasData ? it.Last.Limits.Count : 0; }
+
+        // ---- layout
+
+        void LayoutWide()
+        {
+            pad = P(9); gap = P(11); rowH = P(17);
+            int nw = P(44);
+            foreach (var it in items)
             {
-                int bottom = top + RowsFor(items[i]) * rowH;
-                if (y < bottom + blockGap / 2) return i;
-                top = bottom + blockGap;
+                nw = Math.Max(nw, W(it.P.Name, fName) + P(11));
+                if (it.Last != null && it.Last.Plan != null) nw = Math.Max(nw, W(it.Last.Plan, fSmall));
             }
-            return items.Count - 1;
-        }
-
-        public void Draw(Graphics g, IList<ProviderState> items, DateTime now)
-        {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
+            nameColW = Math.Min(nw, P(130));
+            xName = pad + accentW + P(7);
+            xLabel = xName + nameColW + P(8);
+            xBar = xLabel + labelW + P(7);
+            barW = P(104);
+            xPct = xBar + barW + P(7);
+            xReset = xPct + pctW + P(10);
+            width = (showResets ? xReset + resetW : xPct + pctW) + pad;
             int y = pad - P(1);
             for (int i = 0; i < items.Count; i++)
             {
-                var it = items[i];
-                int rows = RowsFor(it), h = rows * rowH;
-                bool hasData = it.Last != null && it.Last.Limits.Count > 0;
-                bool stale = hasData && it.Error != null;
-
-                // provider accent stripe, name, plan
-                using (var b = new SolidBrush(Theme.Fade(it.P.Accent, stale)))
-                    FillRound(g, b, pad, y + P(2), accentW, h - P(4), accentW / 2f);
-                int nameTextW = Math.Min(W(it.P.Name, fName), nameW - P(11));
-                Txt(g, it.P.Name, fName, xName, y, nameW - P(11), rowH, Theme.Fade(Theme.Text, stale), TextFormatFlags.EndEllipsis);
-                if (it.Last != null && !string.IsNullOrEmpty(it.Last.Plan))
-                    Txt(g, it.Last.Plan, fSmall, xName, y + rowH, nameW, rowH, Theme.Dim, TextFormatFlags.EndEllipsis);
-
-                // status dot: blue while refreshing, amber when the last refresh failed
-                if (it.Busy || stale)
-                {
-                    float r = Math.Max(2f, 2.5f * S);
-                    using (var b = new SolidBrush(it.Busy ? Theme.Ok : Theme.Warn))
-                        g.FillEllipse(b, xName + nameTextW + P(5) - r, y + rowH / 2f - r, r * 2, r * 2);
-                }
-
-                if (hasData)
-                {
-                    for (int j = 0; j < it.Last.Limits.Count; j++)
-                        DrawLimit(g, it.Last.Limits[j], y + j * rowH, now, stale);
-                }
-                else
-                {
-                    string msg = it.Error ?? (it.Busy ? "Loading…" : "Waiting…");
-                    var rect = new Rectangle(xLabel, y, width - pad - xLabel, h);
-                    TextRenderer.DrawText(g, msg, fSmall, rect, it.Error != null ? Theme.Warn : Theme.Dim,
-                        TextFormatFlags.NoPadding | TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter |
-                        TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
-                }
-
+                if (i > 0) y += gap;
+                int h = Math.Max(2, LimitCount(items[i])) * rowH;
+                blocks.Add(new Rectangle(0, y, width, h));
                 y += h;
+            }
+            height = y + pad - P(1);
+        }
+
+        void LayoutNarrow()
+        {
+            pad = P(7); gap = P(10);
+            nHeadH = P(18); nLineH = P(15); nBarRowH = P(9);
+            nLeft = P(10);
+            int need = P(80);
+            foreach (var it in items) need = Math.Max(need, W(it.P.Name, fName) + P(10));
+            need = Math.Max(need, labelW + P(5) + (showResets ? resetW + P(6) : 0) + pctW);
+            nContentW = need;
+            barW = nContentW;
+            width = nLeft + nContentW + pad;
+            int y = pad - P(1);
+            for (int i = 0; i < items.Count; i++)
+            {
+                if (i > 0) y += gap;
+                int n = LimitCount(items[i]);
+                int h = nHeadH + (n > 0 ? n * (nLineH + nBarRowH) : P(36));
+                blocks.Add(new Rectangle(0, y, width, h));
+                y += h;
+            }
+            height = y + pad - P(2);
+        }
+
+        void LayoutStrip(int stripHeight)
+        {
+            pad = P(6); gap = P(16);
+            int H = stripHeight > 0 ? stripHeight : P(44);
+            rowH = Math.Min(P(17), (H - P(4)) / 2);
+            sTop = (H - 2 * rowH) / 2;
+            barW = P(64);
+            int dataW = labelW + P(5) + barW + P(6) + pctW + (showResets ? P(8) + resetW : 0);
+            int x = pad;
+            for (int i = 0; i < items.Count; i++)
+            {
+                var it = items[i];
+                if (i > 0) x += gap;
+                int nw = W(it.P.Name, fName) + P(10);
+                if (it.Last != null && it.Last.Plan != null) nw = Math.Max(nw, W(it.Last.Plan, fSmall));
+                nw = Math.Min(nw, P(110));
+                sNameW.Add(nw);
+                int bw = accentW + P(6) + nw + P(8) + dataW;
+                blocks.Add(new Rectangle(x, 0, bw, H));
+                x += bw;
+            }
+            width = x + pad;
+            height = H;
+        }
+
+        public int HitTest(Point p)
+        {
+            for (int i = 0; i < blocks.Count; i++)
+            {
+                var b = blocks[i];
+                if (mode == ViewMode.Strip ? p.X < b.Right + gap / 2 : p.Y < b.Bottom + gap / 2) return i;
+            }
+            return blocks.Count - 1;
+        }
+
+        // ---- drawing
+
+        public void Draw(Graphics g, DateTime now)
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            if (pal.Transparent) g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            for (int i = 0; i < items.Count && i < blocks.Count; i++)
+            {
+                var it = items[i];
+                var b = blocks[i];
+                bool faded = it.Faded(now);
+                if (mode == ViewMode.Strip) DrawStrip(g, it, b, sNameW[i], faded, now);
+                else if (mode == ViewMode.Narrow) DrawNarrow(g, it, b, faded, now);
+                else DrawWide(g, it, b, faded, now);
+
                 if (i < items.Count - 1)
                 {
-                    using (var pen = new Pen(Theme.Line, Math.Max(1f, S)))
-                        g.DrawLine(pen, pad, y + blockGap / 2f, width - pad, y + blockGap / 2f);
-                    y += blockGap;
+                    var old = g.SmoothingMode;
+                    g.SmoothingMode = SmoothingMode.None;
+                    using (var pen = new Pen(pal.Line, Math.Max(1, P(1))))
+                    {
+                        if (mode == ViewMode.Strip)
+                        {
+                            int x = b.Right + gap / 2;
+                            g.DrawLine(pen, x, sTop + P(3), x, sTop + 2 * rowH - P(3));
+                        }
+                        else
+                        {
+                            int y = b.Bottom + gap / 2;
+                            g.DrawLine(pen, pad, y, width - pad, y);
+                        }
+                    }
+                    g.SmoothingMode = old;
                 }
             }
         }
 
-        void DrawLimit(Graphics g, Limit l, int rowY, DateTime now, bool stale)
+        void DrawWide(Graphics g, ProviderState it, Rectangle b, bool faded, DateTime now)
+        {
+            Accent(g, it, pad, b.Top + P(2), b.Height - P(4), faded);
+            int nameMax = nameColW - P(11);
+            Txt(g, it.P.Name, fName, new Rectangle(xName, b.Top, nameMax, rowH), pal.Fade(pal.Text, faded), false, true);
+            Dot(g, it, xName + Math.Min(W(it.P.Name, fName), nameMax) + P(5), b.Top + rowH / 2f);
+            if (it.Last != null && !string.IsNullOrEmpty(it.Last.Plan))
+                Txt(g, it.Last.Plan, fSmall, new Rectangle(xName, b.Top + rowH, nameColW, rowH), pal.Dim, false, true);
+
+            if (!it.HasData) { Message(g, it, new Rectangle(xLabel, b.Top, width - pad - xLabel, b.Height)); return; }
+            for (int j = 0; j < it.Last.Limits.Count; j++)
+            {
+                var l = it.Last.Limits[j];
+                int y = b.Top + j * rowH;
+                Txt(g, l.Label, fText, new Rectangle(xLabel, y, xBar - xLabel, rowH), pal.Fade(pal.Dim, faded), false, false);
+                Bar(g, l, xBar, y + (rowH - barH) / 2f, barW, faded, now);
+                Txt(g, Fmt.Pct(l.Percent), fText, new Rectangle(xPct, y, pctW, rowH), PctColor(l, faded), true, false);
+                if (showResets && l.ResetsAt.HasValue)
+                    Txt(g, Fmt.Short(l.ResetsAt.Value - now), fText, new Rectangle(xReset, y, resetW, rowH), pal.Fade(pal.Dim, faded), false, false);
+            }
+        }
+
+        void DrawNarrow(Graphics g, ProviderState it, Rectangle b, bool faded, DateTime now)
+        {
+            Accent(g, it, P(3), b.Top + P(2), b.Height - P(4), faded);
+            int x = nLeft;
+            int nameW = W(it.P.Name, fName);
+            string plan = it.Last != null ? it.Last.Plan : null;
+            int planW = string.IsNullOrEmpty(plan) ? 0 : W(plan, fSmall);
+            bool showPlan = planW > 0 && nameW + P(14) + planW <= nContentW;
+            int nameMax = showPlan ? nContentW - planW - P(14) : nContentW - P(10);
+            Txt(g, it.P.Name, fName, new Rectangle(x, b.Top, nameMax, nHeadH), pal.Fade(pal.Text, faded), false, true);
+            Dot(g, it, x + Math.Min(nameW, nameMax) + P(5), b.Top + nHeadH / 2f);
+            if (showPlan) Txt(g, plan, fSmall, new Rectangle(x, b.Top, nContentW, nHeadH), pal.Dim, true, false);
+
+            if (!it.HasData) { Message(g, it, new Rectangle(x, b.Top + nHeadH, nContentW, b.Height - nHeadH)); return; }
+            int y = b.Top + nHeadH;
+            foreach (var l in it.Last.Limits)
+            {
+                Txt(g, l.Label, fText, new Rectangle(x, y, labelW, nLineH), pal.Fade(pal.Dim, faded), false, false);
+                if (showResets && l.ResetsAt.HasValue)
+                    Txt(g, Fmt.Short(l.ResetsAt.Value - now), fSmall, new Rectangle(x + labelW + P(5), y, resetW, nLineH), pal.Fade(pal.Dim, faded), false, false);
+                Txt(g, Fmt.Pct(l.Percent), fText, new Rectangle(x + nContentW - pctW, y, pctW, nLineH), PctColor(l, faded), true, false);
+                Bar(g, l, x, y + nLineH + P(1), nContentW, faded, now);
+                y += nLineH + nBarRowH;
+            }
+        }
+
+        void DrawStrip(Graphics g, ProviderState it, Rectangle b, int nw, bool faded, DateTime now)
+        {
+            Accent(g, it, b.Left, sTop + P(1), 2 * rowH - P(2), faded);
+            int xn = b.Left + accentW + P(6);
+            int nameMax = nw - P(10);
+            Txt(g, it.P.Name, fName, new Rectangle(xn, sTop, nameMax, rowH), pal.Fade(pal.Text, faded), false, true);
+            Dot(g, it, xn + Math.Min(W(it.P.Name, fName), nameMax) + P(5), sTop + rowH / 2f);
+            if (it.Last != null && !string.IsNullOrEmpty(it.Last.Plan))
+                Txt(g, it.Last.Plan, fSmall, new Rectangle(xn, sTop + rowH, nw, rowH), pal.Dim, false, true);
+
+            int xl = xn + nw + P(8);
+            if (!it.HasData) { Message(g, it, new Rectangle(xl, sTop, b.Right - xl, 2 * rowH)); return; }
+            int xb = xl + labelW + P(5), xp = xb + barW + P(6), xr = xp + pctW + P(8);
+            for (int j = 0; j < it.Last.Limits.Count && j < 2; j++)
+            {
+                var l = it.Last.Limits[j];
+                int y = sTop + j * rowH;
+                Txt(g, l.Label, fText, new Rectangle(xl, y, labelW + P(5), rowH), pal.Fade(pal.Dim, faded), false, false);
+                Bar(g, l, xb, y + (rowH - barH) / 2f, barW, faded, now);
+                Txt(g, Fmt.Pct(l.Percent), fText, new Rectangle(xp, y, pctW, rowH), PctColor(l, faded), true, false);
+                if (showResets && l.ResetsAt.HasValue)
+                    Txt(g, Fmt.Short(l.ResetsAt.Value - now), fText, new Rectangle(xr, y, resetW, rowH), pal.Fade(pal.Dim, faded), false, false);
+            }
+        }
+
+        // ---- pieces
+
+        Color PctColor(Limit l, bool faded) { return pal.Fade(l.Percent >= 100 ? pal.High : pal.Text, faded); }
+
+        void Accent(Graphics g, ProviderState it, float x, float y, float h, bool faded)
+        {
+            using (var b = new SolidBrush(pal.Fade(it.P.Accent, faded))) FillRound(g, b, x, y, accentW, h, accentW / 2f);
+        }
+
+        // Blue while refreshing, amber when the last refresh failed and older numbers are showing.
+        void Dot(Graphics g, ProviderState it, float cx, float cy)
+        {
+            if (!it.Busy && !it.Warning) return;
+            float r = Math.Max(2f, 2.5f * S);
+            using (var b = new SolidBrush(it.Busy ? pal.Ok : pal.Warn)) g.FillEllipse(b, cx - r, cy - r, r * 2, r * 2);
+        }
+
+        void Message(Graphics g, ProviderState it, Rectangle rc)
+        {
+            string msg = it.Error ?? (it.Busy ? "Loading…" : "Waiting…");
+            Para(g, msg, fSmall, rc, it.Error != null ? pal.Warn : pal.Dim);
+        }
+
+        // Usage bar with a pace tick showing how much of the window's time has gone by.
+        void Bar(Graphics g, Limit l, float x, float y, float w, bool faded, DateTime now)
         {
             double pct = Math.Max(0, Math.Min(100, l.Percent));
-            Txt(g, l.Label, fText, xLabel, rowY, xBar - xLabel, rowH, Theme.Dim, 0);
-
-            float by = rowY + (rowH - barH) / 2f;
-            using (var b = new SolidBrush(Theme.Track)) FillRound(g, b, xBar, by, barW, barH, barH / 2f);
-            float fw = (float)(barW * pct / 100.0);
+            using (var b = new SolidBrush(pal.Track)) FillRound(g, b, x, y, w, barH, barH / 2f);
+            float fw = (float)(w * pct / 100.0);
             if (pct > 0 && fw < barH) fw = barH;
             if (fw > 0)
-                using (var b = new SolidBrush(Theme.Fade(Theme.ForPercent(l.Percent), stale)))
-                    FillRound(g, b, xBar, by, fw, barH, barH / 2f);
-
-            // pace tick: how much of this window's time has gone by
+                using (var b = new SolidBrush(pal.Fade(pal.For(l.Percent), faded)))
+                    FillRound(g, b, x, y, fw, barH, barH / 2f);
             if (l.ResetsAt.HasValue && l.WindowMinutes > 0)
             {
                 double frac = 1 - (l.ResetsAt.Value - now).TotalMinutes / l.WindowMinutes;
                 if (frac > 0 && frac < 1)
                 {
-                    float px = xBar + (float)(barW * frac);
+                    float px = x + (float)(w * frac);
                     float tw = Math.Max(1f, 1.5f * S);
-                    using (var b = new SolidBrush(Color.FromArgb(stale ? 90 : 190, Theme.Text)))
-                        g.FillRectangle(b, px - tw / 2f, by - P(2.5f), tw, barH + P(5));
+                    using (var b = new SolidBrush(Color.FromArgb(faded ? 90 : 190, pal.Text)))
+                        g.FillRectangle(b, px - tw / 2f, y - P(2.5f), tw, barH + P(5));
                 }
             }
-
-            Color pc = l.Percent >= 100 ? Theme.High : Theme.Text;
-            Txt(g, Fmt.Pct(l.Percent), fText, xPct, rowY, pctW, rowH, Theme.Fade(pc, stale), TextFormatFlags.Right);
-            if (showResets && l.ResetsAt.HasValue)
-                Txt(g, Fmt.Short(l.ResetsAt.Value - now), fText, xReset, rowY, resetW, rowH, Theme.Fade(Theme.Dim, stale), 0);
         }
 
-        static void Txt(Graphics g, string s, Font f, int x, int y, int w, int h, Color c, TextFormatFlags extra)
+        void Txt(Graphics g, string s, Font f, Rectangle rc, Color c, bool right, bool ellipsis)
         {
-            TextRenderer.DrawText(g, s, f, new Rectangle(x, y, w, h), c, TF | extra);
+            if (string.IsNullOrEmpty(s) || rc.Width <= 0) return;
+            if (pal.Transparent)
+            {
+                using (var sf = (StringFormat)StringFormat.GenericTypographic.Clone())
+                using (var b = new SolidBrush(c))
+                {
+                    sf.FormatFlags = (sf.FormatFlags | StringFormatFlags.NoWrap) & ~StringFormatFlags.NoClip;
+                    sf.Alignment = right ? StringAlignment.Far : StringAlignment.Near;
+                    sf.LineAlignment = StringAlignment.Center;
+                    sf.Trimming = ellipsis ? StringTrimming.EllipsisCharacter : StringTrimming.None;
+                    g.DrawString(s, f, b, rc, sf);
+                }
+                return;
+            }
+            var flags = TF;
+            if (right) flags |= TextFormatFlags.Right;
+            if (ellipsis) flags |= TextFormatFlags.EndEllipsis;
+            TextRenderer.DrawText(g, s, f, rc, c, flags);
+        }
+
+        void Para(Graphics g, string s, Font f, Rectangle rc, Color c)
+        {
+            if (string.IsNullOrEmpty(s) || rc.Width <= 0) return;
+            if (pal.Transparent)
+            {
+                // Grid-fitted typographic layout spaces wrapped small text oddly; plain anti-aliasing doesn't.
+                var oldHint = g.TextRenderingHint;
+                g.TextRenderingHint = TextRenderingHint.AntiAlias;
+                using (var sf = new StringFormat())
+                using (var b = new SolidBrush(c))
+                {
+                    sf.LineAlignment = StringAlignment.Center;
+                    sf.Trimming = StringTrimming.EllipsisWord;
+                    g.DrawString(s, f, b, rc, sf);
+                }
+                g.TextRenderingHint = oldHint;
+                return;
+            }
+            TextRenderer.DrawText(g, s, f, rc, c,
+                TextFormatFlags.NoPadding | TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter |
+                TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
         }
 
         static void FillRound(Graphics g, Brush b, float x, float y, float w, float h, float r)
@@ -940,7 +1252,14 @@ namespace UsageTracker
             }
         }
 
-        public void Dispose() { fName.Dispose(); fText.Dispose(); fSmall.Dispose(); }
+        public void Dispose()
+        {
+            measure.Dispose();
+            measureBmp.Dispose();
+            fName.Dispose();
+            fText.Dispose();
+            fSmall.Dispose();
+        }
     }
 
     static class AppIcon
@@ -956,6 +1275,116 @@ namespace UsageTracker
         }
     }
 
+    // ------------------------------------------------------------------ taskbar helpers
+
+    static class Taskbar
+    {
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+        [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+
+        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+
+        // The strip a display's taskbar occupies (bottom or top), or empty when it has none or it auto-hides.
+        public static Rectangle Area(Screen s)
+        {
+            var b = s.Bounds;
+            var wa = s.WorkingArea;
+            if (wa.Bottom < b.Bottom) return new Rectangle(b.Left, wa.Bottom, b.Width, b.Bottom - wa.Bottom);
+            if (wa.Top > b.Top) return new Rectangle(b.Left, b.Top, b.Width, wa.Top - b.Top);
+            return Rectangle.Empty;
+        }
+
+        public static string Side(Screen s)
+        {
+            if (s.Primary) return "main";
+            var p = Screen.PrimaryScreen.Bounds;
+            var b = s.Bounds;
+            if (b.Left >= p.Right) return "right";
+            if (b.Right <= p.Left) return "left";
+            if (b.Top >= p.Bottom) return "lower";
+            if (b.Bottom <= p.Top) return "upper";
+            return "other";
+        }
+
+        public static string Number(Screen s)
+        {
+            var m = Regex.Match(s.DeviceName ?? "", @"(\d+)\s*$");
+            return m.Success ? m.Groups[1].Value : "?";
+        }
+
+        public static Screen Find(string device, string side)
+        {
+            foreach (var s in Screen.AllScreens) if (s.DeviceName == device) return s;
+            foreach (var s in Screen.AllScreens) if (Side(s) == side) return s;
+            return null;
+        }
+
+        public static Rectangle RectOf(IntPtr h)
+        {
+            RECT r;
+            if (!GetWindowRect(h, out r)) return Rectangle.Empty;
+            return Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
+        }
+
+        public static string ClassOf(IntPtr h)
+        {
+            var sb = new StringBuilder(256);
+            GetClassName(h, sb, sb.Capacity);
+            return sb.ToString();
+        }
+
+        // The taskbar window (main or secondary) that covers the given strip.
+        public static IntPtr WindowFor(Rectangle area, IntPtr cached)
+        {
+            if (cached != IntPtr.Zero && IsWindow(cached) && Covers(RectOf(cached), area)) return cached;
+            foreach (var cls in new[] { "Shell_TrayWnd", "Shell_SecondaryTrayWnd" })
+            {
+                IntPtr h = IntPtr.Zero;
+                while ((h = FindWindowEx(IntPtr.Zero, h, cls, null)) != IntPtr.Zero)
+                    if (IsWindowVisible(h) && Covers(RectOf(h), area)) return h;
+            }
+            return IntPtr.Zero;
+        }
+
+        static bool Covers(Rectangle win, Rectangle area)
+        {
+            var i = Rectangle.Intersect(win, area);
+            return (long)i.Width * i.Height * 2 > (long)area.Width * area.Height;
+        }
+
+        // Where the tray or clock starts on that taskbar, if Windows exposes it as a window.
+        public static int TrayLeft(IntPtr taskbar)
+        {
+            if (taskbar == IntPtr.Zero) return -1;
+            foreach (var cls in new[] { "TrayNotifyWnd", "ClockButton" })
+            {
+                IntPtr c = FindWindowEx(taskbar, IntPtr.Zero, cls, null);
+                if (c != IntPtr.Zero && IsWindowVisible(c))
+                {
+                    var r = RectOf(c);
+                    if (r.Width > 0) return r.Left;
+                }
+            }
+            return -1;
+        }
+
+        public static bool IsLightTheme()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    var v = k == null ? null : k.GetValue("SystemUsesLightTheme");
+                    return v is int && (int)v == 1;
+                }
+            }
+            catch { return false; }
+        }
+    }
+
     // ------------------------------------------------------------------ the widget window
 
     class Widget : Form
@@ -963,9 +1392,29 @@ namespace UsageTracker
         [DllImport("user32.dll")] static extern bool ReleaseCapture();
         [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
         [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
+        [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+        [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+        [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+        [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+        [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+        [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+        [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref PT pptDst, ref SZ psize, IntPtr hdcSrc, ref PT pptSrc, int crKey, ref BLEND pblend, int flags);
+        [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr mod, WinEventProc proc, uint pid, uint tid, uint flags);
+        [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hook);
+        delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int obj, int child, uint thread, uint time);
 
+        [StructLayout(LayoutKind.Sequential)] struct PT { public int X, Y; public PT(int x, int y) { X = x; Y = y; } }
+        [StructLayout(LayoutKind.Sequential)] struct SZ { public int W, H; public SZ(int w, int h) { W = w; H = h; } }
+        [StructLayout(LayoutKind.Sequential, Pack = 1)] struct BLEND { public byte Op, Flags, Alpha, Format; }
+
+        static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOACTIVATE = 0x10;
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         const string RunName = "UsageTracker";
+        const int DefaultDockGap = 110;   // px at 100% scale: clears the clock on a secondary taskbar
 
         readonly EventWaitHandle showSignal;
         AppConfig cfg;
@@ -975,13 +1424,22 @@ namespace UsageTracker
         float dpi = 1f;
         int hover = -1;
 
+        bool wantLayered;      // the window is (or will be created as) a per-pixel-alpha layered window
+        bool docked;           // taskbar mode is on and the chosen display has a visible taskbar
+        bool placedOnce, userHidden, autoHidden;
+        Screen dockScreen;
+        Rectangle dockBar;
+        IntPtr taskbarHwnd, winHook;
+        WinEventProc hookProc;
+
         readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer { Interval = 15000 };
         readonly System.Windows.Forms.Timer reload = new System.Windows.Forms.Timer { Interval = 700 };
+        readonly System.Windows.Forms.Timer keeper = new System.Windows.Forms.Timer { Interval = 1500 };
         FileSystemWatcher watcher;
         NotifyIcon tray;
         ContextMenuStrip menu;
         ToolTip tip;
-        ToolStripMenuItem miShow, miTop, miResets, miStartup, miSize, miOpacity;
+        ToolStripMenuItem miShow, miTop, miResets, miStartup, miSize, miOpacity, miLayout;
 
         public Widget(EventWaitHandle showSignal)
         {
@@ -999,7 +1457,7 @@ namespace UsageTracker
             if (ico != null) Icon = ico;
 
             st = AppState.Load(Paths.StateFile);
-            using (var g = CreateGraphics()) dpi = g.DpiX / 96f;
+            using (var g = Graphics.FromHwnd(IntPtr.Zero)) dpi = g.DpiX / 96f;   // no window handle yet on purpose
             LoadConfig();
             BuildMenu();
 
@@ -1015,12 +1473,11 @@ namespace UsageTracker
             tip = new ToolTip { InitialDelay = 400, ReshowDelay = 100, AutoPopDelay = 30000, ShowAlways = true };
             ContextMenuStrip = menu;
 
-            ApplyState();
-            Relayout(false);
-            PlaceWindow();
+            ApplyLayout();
 
             tick.Tick += (s, e) => OnTick();
-            reload.Tick += (s, e) => { reload.Stop(); LoadConfig(); Relayout(true); RefreshAll(); };
+            keeper.Tick += (s, e) => KeepDocked();
+            reload.Tick += (s, e) => { reload.Stop(); LoadConfig(); Relayout(true); OnTick(); };
             watcher = new FileSystemWatcher(Paths.AppDir, "config.json")
             {
                 NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size,
@@ -1031,6 +1488,8 @@ namespace UsageTracker
             watcher.Renamed += (s, e) => { reload.Stop(); reload.Start(); };
             watcher.EnableRaisingEvents = true;
             SystemEvents.PowerModeChanged += OnPowerChange;
+            SystemEvents.DisplaySettingsChanged += OnDisplayChange;
+            SystemEvents.UserPreferenceChanged += OnPreferenceChange;
         }
 
         protected override bool ShowWithoutActivation { get { return true; } }
@@ -1040,7 +1499,8 @@ namespace UsageTracker
             get
             {
                 var cp = base.CreateParams;
-                cp.ExStyle |= 0x80;   // WS_EX_TOOLWINDOW: no taskbar button, not in Alt+Tab
+                cp.ExStyle |= 0x80;                      // WS_EX_TOOLWINDOW: no taskbar button, not in Alt+Tab
+                if (wantLayered) cp.ExStyle |= 0x80000;  // WS_EX_LAYERED, fed by UpdateLayeredWindow
                 return cp;
             }
         }
@@ -1048,6 +1508,7 @@ namespace UsageTracker
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
+            if (wantLayered) { PushLayered(); return; }
             try
             {
                 int round = 2;   // DWMWCP_ROUND (Windows 11)
@@ -1066,10 +1527,16 @@ namespace UsageTracker
                 try { BeginInvoke(new Action(ShowWidget)); } catch { }
             }, null, -1, false);
             tick.Start();
-            RefreshAll();
+            Redraw();
+            OnTick();   // first fetch for every provider
         }
 
-        // ---- config, layout, placement
+        // ---- config and layout
+
+        ViewMode Mode
+        {
+            get { return docked ? ViewMode.Strip : st.Layout == "narrow" ? ViewMode.Narrow : ViewMode.Wide; }
+        }
 
         void LoadConfig()
         {
@@ -1079,37 +1546,113 @@ namespace UsageTracker
             {
                 var ps = new ProviderState { P = p };
                 var prev = items.FirstOrDefault(o => o.P.Key == p.Key);
-                if (prev != null) { ps.Last = prev.Last; ps.Error = prev.Error; }
+                if (prev != null)
+                {
+                    ps.Last = prev.Last;
+                    ps.Error = prev.Error;
+                    ps.Failures = prev.Failures;
+                    ps.LastAttempt = prev.LastAttempt;
+                    ps.NextDue = prev.NextDue;
+                }
                 fresh.Add(ps);
             }
             items = fresh;
             hover = -1;
         }
 
+        void ResolveDock()
+        {
+            docked = false;
+            dockScreen = null;
+            dockBar = Rectangle.Empty;
+            if (st.Layout != "taskbar") return;
+            var s = Taskbar.Find(st.DockScreen, st.DockSide);
+            if (s == null) return;
+            var bar = Taskbar.Area(s);
+            if (bar.IsEmpty) return;
+            dockScreen = s;
+            dockBar = bar;
+            docked = true;
+        }
+
+        // Re-applies the chosen layout: picks the display, switches the window between a normal
+        // window and a transparent taskbar strip, sizes it and puts it in place.
+        void ApplyLayout()
+        {
+            ResolveDock();
+            if (docked != wantLayered)
+            {
+                wantLayered = docked;
+                if (docked) Opacity = 1.0;   // taskbar mode does its own opacity; keep WinForms out of it
+                if (IsHandleCreated) RecreateHandle();
+            }
+            ApplyState();
+            Relayout(false);
+            Place();
+            placedOnce = true;
+            Redraw();
+            if (docked && winHook == IntPtr.Zero)
+            {
+                hookProc = OnForegroundChanged;
+                winHook = SetWinEventHook(3, 3, IntPtr.Zero, hookProc, 0, 0, 0);   // EVENT_SYSTEM_FOREGROUND, out of context
+            }
+            else if (!docked && winHook != IntPtr.Zero)
+            {
+                UnhookWinEvent(winHook);
+                winHook = IntPtr.Zero;
+            }
+            if (st.Layout == "taskbar") keeper.Start(); else keeper.Stop();
+        }
+
         void Relayout(bool keepOnScreen)
         {
             if (r != null) r.Dispose();
-            r = new Renderer(dpi * (float)st.UiScale, st.ShowResets, items);
-            var size = r.Measure(items);
+            var pal = docked ? (Taskbar.IsLightTheme() ? Palette.LightTaskbar : Palette.DarkTaskbar) : Palette.Dark;
+            r = new Renderer(dpi * (float)st.UiScale, Mode, st.ShowResets, pal, docked ? dockBar.Height : 0, items);
+            var size = r.Size;
             if (size != ClientSize)
             {
                 ClientSize = size;
-                if (keepOnScreen && Visible) KeepOnScreen();
+                if (docked) PlaceDocked();
+                else if (keepOnScreen && Visible) KeepOnScreen();
             }
-            Invalidate();
+            Redraw();
         }
 
-        void PlaceWindow()
+        void Place()
         {
-            var rect = new Rectangle(st.X, st.Y, Width, Height);
-            bool ok = st.X != int.MinValue && Screen.AllScreens.Any(s =>
+            if (docked) { PlaceDocked(); return; }
+            bool narrow = Mode == ViewMode.Narrow;
+            int x = narrow ? st.NX : st.X, y = narrow ? st.NY : st.Y;
+            if (x != int.MinValue && OnScreen(new Rectangle(x, y, Width, Height))) { Location = new Point(x, y); return; }
+            if (placedOnce && OnScreen(Bounds)) { KeepOnScreen(); return; }   // switching layouts: stay put
+            var wa = Screen.PrimaryScreen.WorkingArea;
+            Location = new Point(wa.Right - Width - 16, wa.Bottom - Height - 16);
+        }
+
+        static bool OnScreen(Rectangle rect)
+        {
+            return Screen.AllScreens.Any(s =>
             {
                 var i = Rectangle.Intersect(s.WorkingArea, rect);
                 return i.Width >= 40 && i.Height >= 20;
             });
-            if (ok) { Location = new Point(st.X, st.Y); return; }
-            var wa = Screen.PrimaryScreen.WorkingArea;
-            Location = new Point(wa.Right - Width - 16, wa.Bottom - Height - 16);
+        }
+
+        void PlaceDocked()
+        {
+            int gap = st.DockGap;
+            if (gap < 0)
+            {
+                int trayLeft = Taskbar.TrayLeft(TaskbarWindow());
+                gap = trayLeft > dockBar.Left && trayLeft < dockBar.Right
+                    ? dockBar.Right - trayLeft + (int)Math.Round(8 * dpi)
+                    : (int)Math.Round(DefaultDockGap * dpi);
+            }
+            int x = dockBar.Right - gap - Width;
+            x = Math.Max(dockBar.Left, Math.Min(x, dockBar.Right - Width));
+            var p = new Point(x, dockBar.Top);
+            if (Location != p) Location = p;
         }
 
         void KeepOnScreen()
@@ -1117,25 +1660,106 @@ namespace UsageTracker
             var wa = Screen.FromControl(this).WorkingArea;
             int x = Math.Max(wa.Left, Math.Min(Left, wa.Right - Width));
             int y = Math.Max(wa.Top, Math.Min(Top, wa.Bottom - Height));
-            if (x != Left || y != Top) { Location = new Point(x, y); SavePosition(); }
+            if (x != Left || y != Top) Location = new Point(x, y);
         }
 
-        void SavePosition() { st.X = Left; st.Y = Top; st.Save(Paths.StateFile); }
+        void SavePosition()
+        {
+            if (docked) st.DockGap = dockBar.Right - Right;
+            else if (Mode == ViewMode.Narrow) { st.NX = Left; st.NY = Top; }
+            else { st.X = Left; st.Y = Top; }
+            st.Save(Paths.StateFile);
+        }
 
         void ApplyState()
         {
-            TopMost = st.OnTop;
-            Opacity = Math.Max(30, Math.Min(100, st.Opacity)) / 100.0;
+            TopMost = docked || st.OnTop;
+            if (!wantLayered) Opacity = Math.Max(30, Math.Min(100, st.Opacity)) / 100.0;
+        }
+
+        void SetLayout(string layout, Screen screen)
+        {
+            st.Layout = layout;
+            if (screen != null) { st.DockScreen = screen.DeviceName; st.DockSide = Taskbar.Side(screen); }
+            st.Save(Paths.StateFile);
+            autoHidden = false;
+            ApplyLayout();
+            if (!userHidden && !Visible) Show();
         }
 
         void ShowWidget()
         {
+            userHidden = false;
+            autoHidden = false;
             if (!Visible) Show();
+            if (docked) { SetWindowPos(Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); Redraw(); return; }
             if (!st.OnTop) { TopMost = true; TopMost = false; }   // pop above other windows once
             BringToFront();
         }
 
+        // ---- taskbar mode upkeep
+
+        IntPtr TaskbarWindow()
+        {
+            taskbarHwnd = Taskbar.WindowFor(dockBar, taskbarHwnd);
+            return taskbarHwnd;
+        }
+
+        void OnForegroundChanged(IntPtr hook, uint ev, IntPtr hwnd, int obj, int child, uint thread, uint time)
+        {
+            try { BeginInvoke(new Action(KeepDocked)); } catch { }
+        }
+
+        // Runs every 1.5 s and on every focus change while in taskbar mode: follows display changes,
+        // gets out of the way of full-screen apps, and climbs back above the taskbar after it's clicked.
+        void KeepDocked()
+        {
+            if (st.Layout != "taskbar" || IsDisposed) return;
+            bool was = docked;
+            var oldBar = dockBar;
+            ResolveDock();
+            if (docked != was) { ApplyLayout(); return; }
+            if (!docked) return;
+            if (dockBar != oldBar) { Relayout(false); PlaceDocked(); }
+
+            bool fullscreen = FullscreenOn(dockScreen);
+            if (fullscreen && Visible) { autoHidden = true; Hide(); }
+            else if (!fullscreen && autoHidden)
+            {
+                autoHidden = false;
+                if (!userHidden) { Show(); Redraw(); }
+            }
+
+            if (Visible && TaskbarAbove()) SetWindowPos(Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+
+        bool TaskbarAbove()
+        {
+            IntPtr tb = TaskbarWindow();
+            if (tb == IntPtr.Zero) return false;
+            int guard = 0;
+            for (IntPtr h = GetWindow(Handle, 3); h != IntPtr.Zero && guard < 2000; h = GetWindow(h, 3), guard++)   // GW_HWNDPREV
+                if (h == tb) return true;
+            return false;
+        }
+
+        bool FullscreenOn(Screen s)
+        {
+            IntPtr fg = GetForegroundWindow();
+            if (fg == IntPtr.Zero || fg == Handle) return false;
+            string cls = Taskbar.ClassOf(fg);
+            if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd") return false;
+            var w = Taskbar.RectOf(fg);
+            var b = s.Bounds;
+            return w.Left <= b.Left && w.Top <= b.Top && w.Right >= b.Right && w.Bottom >= b.Bottom;
+        }
+
         // ---- refreshing
+
+        TimeSpan IntervalFor(ProviderState it)
+        {
+            return TimeSpan.FromMinutes(Math.Max(cfg.RefreshMinutes, it.P.MinIntervalMinutes));
+        }
 
         void RefreshAll() { foreach (var it in items) StartFetch(it); }
 
@@ -1144,21 +1768,37 @@ namespace UsageTracker
             if (it.Busy) return;
             it.Busy = true;
             it.LastAttempt = DateTime.UtcNow;
-            Invalidate();
+            Redraw();
             ThreadPool.QueueUserWorkItem(_ =>
             {
-                Snapshot snap; string err;
-                Fetcher.Run(it.P, out snap, out err);
-                try { BeginInvoke(new Action(() => OnFetched(it, snap, err))); }
+                var res = Fetcher.Run(it.P);
+                try { BeginInvoke(new Action(() => OnFetched(it, res))); }
                 catch { }
             });
         }
 
-        void OnFetched(ProviderState it, Snapshot snap, string err)
+        void OnFetched(ProviderState it, FetchResult res)
         {
             it.Busy = false;
-            if (snap != null) { it.Last = snap; it.Error = null; }
-            else it.Error = err;
+            var now = DateTime.UtcNow;
+            var interval = IntervalFor(it);
+            if (res.Snap != null)
+            {
+                it.Last = res.Snap;
+                it.Error = null;
+                it.Failures = 0;
+                it.NextDue = now + interval;
+            }
+            else
+            {
+                it.Error = res.Error;
+                it.Failures++;
+                var wait = interval;
+                if (res.RateLimited)   // back off: 5, 10, 20, then 30 minutes
+                    wait = TimeSpan.FromMinutes(Math.Max(interval.TotalMinutes, Math.Min(30, 5 * Math.Pow(2, Math.Min(it.Failures, 4) - 1))));
+                if (res.RetryAfter.HasValue && res.RetryAfter.Value > wait) wait = res.RetryAfter.Value;
+                it.NextDue = now + wait;
+            }
             UpdateTrayText();
             Relayout(true);
             if (hover >= 0 && hover < items.Count) tip.SetToolTip(this, TipText(items[hover]));
@@ -1167,18 +1807,17 @@ namespace UsageTracker
         void OnTick()
         {
             var now = DateTime.UtcNow;
-            var interval = TimeSpan.FromMinutes(cfg.RefreshMinutes);
             foreach (var it in items)
             {
                 if (it.Busy) continue;
-                bool due = now - it.LastAttempt >= interval;
-                // a window just reset: fetch fresh numbers instead of waiting for the next poll
-                if (!due && it.Last != null && now - it.LastAttempt >= TimeSpan.FromSeconds(60))
+                bool due = now >= it.NextDue;
+                // A window just reset: check once for fresh numbers instead of waiting for the next poll.
+                if (!due && it.Failures == 0 && it.Last != null && now - it.LastAttempt >= TimeSpan.FromSeconds(60))
                     foreach (var l in it.Last.Limits)
-                        if (l.ResetsAt.HasValue && l.ResetsAt.Value < now && it.Last.FetchedAt < l.ResetsAt.Value) due = true;
+                        if (l.ResetsAt.HasValue && l.ResetsAt.Value < now && it.LastAttempt < l.ResetsAt.Value) due = true;
                 if (due) StartFetch(it);
             }
-            Invalidate();   // countdowns and pace ticks move
+            Redraw();   // countdowns and pace ticks move
         }
 
         void OnPowerChange(object sender, PowerModeChangedEventArgs e)
@@ -1188,21 +1827,77 @@ namespace UsageTracker
             {
                 BeginInvoke(new Action(() =>
                 {
-                    // refresh about 20 s after waking, once the network is back
-                    var soon = DateTime.UtcNow - TimeSpan.FromMinutes(cfg.RefreshMinutes) + TimeSpan.FromSeconds(20);
-                    foreach (var it in items) if (!it.Busy) it.LastAttempt = soon;
+                    // check again about 20 s after waking, once the network is back
+                    var soon = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+                    foreach (var it in items) if (!it.Busy && it.NextDue > soon) it.NextDue = soon;
                 }));
             }
             catch { }
         }
 
-        // ---- painting and mouse
+        void OnDisplayChange(object sender, EventArgs e)
+        {
+            try { BeginInvoke(new Action(() => { taskbarHwnd = IntPtr.Zero; ApplyLayout(); })); } catch { }
+        }
+
+        void OnPreferenceChange(object sender, UserPreferenceChangedEventArgs e)
+        {
+            if (!docked) return;
+            try { BeginInvoke(new Action(() => Relayout(false))); } catch { }   // light/dark switch, taskbar size
+        }
+
+        // ---- painting
+
+        void Redraw()
+        {
+            if (wantLayered) PushLayered();
+            else Invalidate();
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            if (wantLayered) return;
             e.Graphics.Clear(Theme.Bg);
-            if (r != null) r.Draw(e.Graphics, items, DateTime.UtcNow);
+            if (r != null) r.Draw(e.Graphics, DateTime.UtcNow);
         }
+
+        // Taskbar mode: draw onto a transparent bitmap and hand it to Windows with per-pixel alpha.
+        void PushLayered()
+        {
+            if (!IsHandleCreated || r == null) return;
+            int w = Width, h = Height;
+            if (w <= 0 || h <= 0) return;
+            using (var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb))
+            {
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.FromArgb(1, 0, 0, 0));   // invisible, but keeps the whole strip clickable
+                    r.Draw(g, DateTime.UtcNow);
+                }
+                IntPtr screenDc = GetDC(IntPtr.Zero);
+                IntPtr memDc = CreateCompatibleDC(screenDc);
+                IntPtr hbmp = IntPtr.Zero, old = IntPtr.Zero;
+                try
+                {
+                    hbmp = bmp.GetHbitmap(Color.FromArgb(0));
+                    old = SelectObject(memDc, hbmp);
+                    var size = new SZ(w, h);
+                    var src = new PT(0, 0);
+                    var dst = new PT(Left, Top);
+                    var blend = new BLEND { Op = 0, Flags = 0, Alpha = (byte)(Math.Max(30, Math.Min(100, st.Opacity)) * 255 / 100), Format = 1 };
+                    UpdateLayeredWindow(Handle, screenDc, ref dst, ref size, memDc, ref src, 0, ref blend, 2);   // ULW_ALPHA
+                }
+                finally
+                {
+                    if (old != IntPtr.Zero) SelectObject(memDc, old);
+                    if (hbmp != IntPtr.Zero) DeleteObject(hbmp);
+                    DeleteDC(memDc);
+                    ReleaseDC(IntPtr.Zero, screenDc);
+                }
+            }
+        }
+
+        // ---- mouse
 
         protected override void OnMouseDown(MouseEventArgs e)
         {
@@ -1215,6 +1910,16 @@ namespace UsageTracker
 
         protected override void WndProc(ref Message m)
         {
+            if (m.Msg == 0x0216 && docked)   // WM_MOVING: in taskbar mode, slide along the taskbar only
+            {
+                var rc = (Taskbar.RECT)Marshal.PtrToStructure(m.LParam, typeof(Taskbar.RECT));
+                int w = rc.Right - rc.Left, h = rc.Bottom - rc.Top;
+                int x = Math.Max(dockBar.Left, Math.Min(rc.Left, dockBar.Right - w));
+                rc.Left = x; rc.Right = x + w; rc.Top = dockBar.Top; rc.Bottom = dockBar.Top + h;
+                Marshal.StructureToPtr(rc, m.LParam, false);
+                m.Result = (IntPtr)1;
+                return;
+            }
             base.WndProc(ref m);
             if (m.Msg == 0x0232) SavePosition();   // WM_EXITSIZEMOVE: drag finished
         }
@@ -1223,7 +1928,7 @@ namespace UsageTracker
         {
             base.OnMouseMove(e);
             if (r == null || items.Count == 0) return;
-            int h = r.HitTest(items, e.Y);
+            int h = r.HitTest(e.Location);
             if (h == hover) return;
             hover = h;
             tip.SetToolTip(this, TipText(items[h]));
@@ -1258,12 +1963,18 @@ namespace UsageTracker
                     }
                 }
                 sb.AppendLine();
-                sb.Append("Updated " + it.Last.FetchedAt.ToLocalTime().ToString("h:mm tt", CultureInfo.CurrentCulture));
+                sb.Append("Updated " + Fmt.Clock(it.Last.FetchedAt));
             }
             if (it.Error != null)
             {
                 sb.AppendLine();
-                sb.Append(it.Last != null ? "Last refresh failed: " + it.Error : it.Error);
+                sb.Append(it.Last != null ? "Last check failed: " + it.Error : it.Error);
+                if (it.NextDue > now && !it.Busy) sb.Append(". Next try " + Fmt.Clock(it.NextDue));
+            }
+            if (st.Layout == "taskbar" && !docked)
+            {
+                sb.AppendLine();
+                sb.Append("That display has no visible taskbar, so this is floating for now");
             }
             return sb.ToString();
         }
@@ -1292,9 +2003,16 @@ namespace UsageTracker
         {
             menu = new ContextMenuStrip();
             var m = menu.Items;
-            miShow = Item(m, "Hide", () => { if (Visible) Hide(); else ShowWidget(); });
+            miShow = Item(m, "Hide", () =>
+            {
+                if (Visible || autoHidden) { userHidden = true; autoHidden = false; Hide(); }
+                else ShowWidget();
+            });
             Item(m, "Refresh now", RefreshAll);
             m.Add(new ToolStripSeparator());
+            miLayout = new ToolStripMenuItem("Layout");
+            miLayout.DropDownItems.Add(new ToolStripMenuItem("(filled when opened)"));
+            m.Add(miLayout);
             miTop = Item(m, "Always on top", () => { st.OnTop = !st.OnTop; ApplyState(); st.Save(Paths.StateFile); });
             miResets = Item(m, "Show reset times", () => { st.ShowResets = !st.ShowResets; Relayout(true); st.Save(Paths.StateFile); });
 
@@ -1302,7 +2020,7 @@ namespace UsageTracker
             foreach (var pair in new[] { Tuple.Create("Small", 0.85), Tuple.Create("Normal", 1.0), Tuple.Create("Large", 1.25), Tuple.Create("Extra large", 1.5) })
             {
                 var v = pair.Item2;
-                var mi = Item(miSize.DropDownItems, pair.Item1, () => { st.UiScale = v; Relayout(true); st.Save(Paths.StateFile); });
+                var mi = Item(miSize.DropDownItems, pair.Item1, () => { st.UiScale = v; Relayout(true); if (docked) PlaceDocked(); st.Save(Paths.StateFile); });
                 mi.Tag = v;
             }
             m.Add(miSize);
@@ -1311,7 +2029,7 @@ namespace UsageTracker
             foreach (var pct in new[] { 100, 90, 80, 70, 60, 50 })
             {
                 var v = pct;
-                var mi = Item(miOpacity.DropDownItems, pct + "%", () => { st.Opacity = v; ApplyState(); st.Save(Paths.StateFile); });
+                var mi = Item(miOpacity.DropDownItems, pct + "%", () => { st.Opacity = v; ApplyState(); Redraw(); st.Save(Paths.StateFile); });
                 mi.Tag = v;
             }
             m.Add(miOpacity);
@@ -1324,13 +2042,39 @@ namespace UsageTracker
 
             menu.Opening += (s, e) =>
             {
-                miShow.Text = Visible ? "Hide" : "Show";
-                miTop.Checked = st.OnTop;
+                miShow.Text = Visible || autoHidden ? "Hide" : "Show";
+                FillLayoutMenu();
+                miTop.Checked = docked || st.OnTop;
+                miTop.Enabled = !docked;
                 miResets.Checked = st.ShowResets;
                 miStartup.Checked = StartupEnabled();
                 foreach (ToolStripMenuItem mi in miSize.DropDownItems) mi.Checked = Math.Abs((double)mi.Tag - st.UiScale) < 0.01;
                 foreach (ToolStripMenuItem mi in miOpacity.DropDownItems) mi.Checked = (int)mi.Tag == st.Opacity;
             };
+        }
+
+        void FillLayoutMenu()
+        {
+            var dd = miLayout.DropDownItems;
+            dd.Clear();
+            Item(dd, "Wide", () => SetLayout("wide", null)).Checked = st.Layout == "wide";
+            Item(dd, "Narrow (vertical)", () => SetLayout("narrow", null)).Checked = st.Layout == "narrow";
+            dd.Add(new ToolStripSeparator());
+            var screens = Screen.AllScreens.OrderBy(s => s.Bounds.Left).ThenBy(s => s.Bounds.Top).ToList();
+            foreach (var s in screens)
+            {
+                var screen = s;
+                string side = Taskbar.Side(s);
+                string label = screens.Count == 1 ? "In the taskbar"
+                    : side == "main" ? "In the taskbar on the main display"
+                    : "In the taskbar on the " + side + " display";
+                if (screens.Count(o => Taskbar.Side(o) == side) > 1) label += " (" + Taskbar.Number(s) + ")";
+                bool hasBar = !Taskbar.Area(s).IsEmpty;
+                if (!hasBar) label += " (no taskbar)";
+                var mi = Item(dd, label, () => SetLayout("taskbar", screen));
+                mi.Enabled = hasBar;
+                mi.Checked = st.Layout == "taskbar" && (st.DockScreen == s.DeviceName || (docked && dockScreen != null && dockScreen.DeviceName == s.DeviceName));
+            }
         }
 
         static bool StartupEnabled()
@@ -1372,7 +2116,11 @@ namespace UsageTracker
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             SystemEvents.PowerModeChanged -= OnPowerChange;
+            SystemEvents.DisplaySettingsChanged -= OnDisplayChange;
+            SystemEvents.UserPreferenceChanged -= OnPreferenceChange;
+            if (winHook != IntPtr.Zero) { UnhookWinEvent(winHook); winHook = IntPtr.Zero; }
             tick.Stop();
+            keeper.Stop();
             watcher.Dispose();
             tray.Visible = false;
             tray.Dispose();
@@ -1382,14 +2130,27 @@ namespace UsageTracker
 
     // ------------------------------------------------------------------ --render (testing / screenshots)
 
+    // UsageTracker.exe --render out.png [--demo] [--scale 2] [--layout wide|narrow|strip]
+    //                  [--taskbar light|dark] [--height 48] [--no-resets]
     static class RenderCli
     {
+        static string Arg(string[] args, string name)
+        {
+            int i = Array.IndexOf(args, name);
+            return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
+        }
+
         public static int ToFile(string outPath, string[] args)
         {
             float scale = 1f;
-            int si = Array.IndexOf(args, "--scale");
-            if (si >= 0 && si + 1 < args.Length) float.TryParse(args[si + 1], NumberStyles.Float, CultureInfo.InvariantCulture, out scale);
+            if (Arg(args, "--scale") != null) float.TryParse(Arg(args, "--scale"), NumberStyles.Float, CultureInfo.InvariantCulture, out scale);
             bool showResets = Array.IndexOf(args, "--no-resets") < 0;
+            string layout = Arg(args, "--layout") ?? "wide";
+            var mode = layout == "narrow" ? ViewMode.Narrow : layout == "strip" ? ViewMode.Strip : ViewMode.Wide;
+            bool light = Arg(args, "--taskbar") == "light";
+            int height = 0;
+            if (Arg(args, "--height") != null) int.TryParse(Arg(args, "--height"), out height);
+            if (mode == ViewMode.Strip && height == 0) height = (int)Math.Round(48 * scale);
 
             List<ProviderState> items;
             if (Array.IndexOf(args, "--demo") >= 0) items = Demo();
@@ -1400,9 +2161,9 @@ namespace UsageTracker
                 {
                     var t = new Thread(() =>
                     {
-                        Snapshot snap; string err;
-                        Fetcher.Run(it.P, out snap, out err);
-                        it.Last = snap; it.Error = err;
+                        var res = Fetcher.Run(it.P);
+                        it.Last = res.Snap;
+                        it.Error = res.Error;
                     });
                     t.Start();
                     return t;
@@ -1410,15 +2171,18 @@ namespace UsageTracker
                 threads.ForEach(t => t.Join());
             }
 
-            using (var r = new Renderer(scale, showResets, items))
+            var pal = mode == ViewMode.Strip ? (light ? Palette.LightTaskbar : Palette.DarkTaskbar) : Palette.Dark;
+            using (var r = new Renderer(scale, mode, showResets, pal, height, items))
             {
-                var size = r.Measure(items);
-                using (var bmp = new Bitmap(size.Width, size.Height, PixelFormat.Format24bppRgb))
+                var size = r.Size;
+                // A strip is drawn over a flat stand-in for the taskbar colour.
+                var bg = mode != ViewMode.Strip ? Theme.Bg : light ? Color.FromArgb(238, 240, 243) : Color.FromArgb(32, 32, 32);
+                using (var bmp = new Bitmap(size.Width, size.Height, mode == ViewMode.Strip ? PixelFormat.Format32bppArgb : PixelFormat.Format24bppRgb))
                 {
                     using (var g = Graphics.FromImage(bmp))
                     {
-                        g.Clear(Theme.Bg);
-                        r.Draw(g, items, DateTime.UtcNow);
+                        g.Clear(bg);
+                        r.Draw(g, DateTime.UtcNow);
                     }
                     bmp.Save(outPath, ImageFormat.Png);
                 }
@@ -1446,13 +2210,14 @@ namespace UsageTracker
             var a = mk("Claude", Color.FromArgb(217, 119, 87), "Max 5x");
             a.Last.Limits.Add(Limit.Make(300, 42, now.AddMinutes(133), null));
             a.Last.Limits.Add(Limit.Make(10080, 18, now.AddHours(100), null));
-            var b = mk("Codex", Color.FromArgb(16, 163, 127), "Plus");
+            var b = mk("Codex", Color.FromArgb(16, 163, 127), "Team");
             b.Last.Limits.Add(Limit.Make(300, 76, now.AddMinutes(41), null));
             b.Last.Limits.Add(Limit.Make(10080, 93, now.AddHours(30), null));
             var c = mk("Gemini", Color.FromArgb(120, 140, 240), "Pro");
             c.Last.Limits.Add(Limit.Make(300, 12, now.AddMinutes(250), null));
             c.Last.Limits.Add(Limit.Make(10080, 40, now.AddHours(80), null));
             c.Error = "Offline: can't reach example.com";
+            c.Last.FetchedAt = now.AddMinutes(-40);   // old enough to show dimmed
             var d = mk("Cursor", Color.FromArgb(154, 160, 166), null);
             d.Error = "Not signed in to Codex";
             return new List<ProviderState> { a, b, c, d };
