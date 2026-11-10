@@ -1,0 +1,18 @@
+# Build output (published as a GitHub Release instead)
+UsageTracker.exe
+*.pdb
+
+# Per-user files the app writes next to the exe
+config.json
+state.json
+error.log
+
+# --render test output
+*.png.txt
+
+# Local notes, not part of the project
+/Idea
+
+# Claude Code: keep only the shared settings
+.claude/*
+!.claude/settings.json
