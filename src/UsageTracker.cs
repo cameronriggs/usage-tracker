@@ -27,8 +27,8 @@ using Microsoft.Win32;
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 [assembly: AssemblyTitle("Usage Tracker")]
 [assembly: AssemblyProduct("Usage Tracker")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
 
 namespace UsageTracker
 {
@@ -195,6 +195,15 @@ namespace UsageTracker
             if (t.TotalMinutes < 60) return Math.Max(1, (int)Math.Ceiling(t.TotalMinutes)) + "m";
             if (t.TotalHours < 24) return (int)t.TotalHours + "h " + t.Minutes.ToString("00") + "m";
             return (int)t.TotalDays + "d " + t.Hours + "h";
+        }
+
+        // Coarse countdown for the narrow layout's bars: "43m", "3h", "40h", "5d".
+        public static string Tiny(TimeSpan t)
+        {
+            if (t.TotalSeconds <= 0) return "now";
+            if (t.TotalMinutes < 60) return Math.Max(1, (int)Math.Ceiling(t.TotalMinutes)) + "m";
+            if (t.TotalHours < 48) return (int)t.TotalHours + "h";
+            return (int)t.TotalDays + "d";
         }
 
         public static string Clock(DateTime utc)
@@ -878,14 +887,14 @@ namespace UsageTracker
         readonly bool showResets;
         readonly Palette pal;
         readonly IList<ProviderState> items;
-        readonly Font fName, fText, fSmall;
+        readonly Font fName, fText, fSmall, fTiny;
         readonly Bitmap measureBmp = new Bitmap(1, 1);
         readonly Graphics measure;   // measuring through a DC is tight; the DC-less overload pads ~8 px
         readonly List<Rectangle> blocks = new List<Rectangle>();
         readonly int accentW, barH, labelW, pctW, resetW;
         int pad, gap, rowH, barW, width, height;
         int xName, nameColW, xLabel, xBar, xPct, xReset;       // wide
-        int nLeft, nContentW, nHeadH, nLineH, nBarRowH;         // narrow
+        int nSlotW, nBarW, nHName, nHAccent, nHPlan, nHPct, nHBar, nHLabel, nHReset;   // narrow
         int sTop;                                               // strip
         readonly List<int> sNameW = new List<int>();
 
@@ -899,6 +908,7 @@ namespace UsageTracker
             fName = new Font("Segoe UI Semibold", 12f * S, FontStyle.Regular, GraphicsUnit.Pixel);
             fText = new Font("Segoe UI", 11.5f * S, FontStyle.Regular, GraphicsUnit.Pixel);
             fSmall = new Font("Segoe UI", 10.5f * S, FontStyle.Regular, GraphicsUnit.Pixel);
+            fTiny = new Font("Segoe UI", 10f * S, FontStyle.Regular, GraphicsUnit.Pixel);
             measure = Graphics.FromImage(measureBmp);
 
             accentW = Math.Max(2, P(3));
@@ -976,27 +986,27 @@ namespace UsageTracker
             height = y + pad - P(1);
         }
 
+        // Narrow: one column per provider, two columns per row, each limit a tall bar that fills upward.
         void LayoutNarrow()
         {
-            pad = P(7); gap = P(10);
-            nHeadH = P(18); nLineH = P(15); nBarRowH = P(9);
-            nLeft = P(10);
-            int need = P(80);
-            foreach (var it in items) need = Math.Max(need, W(it.P.Name, fName) + P(10));
-            need = Math.Max(need, labelW + P(5) + (showResets ? resetW + P(6) : 0) + pctW);
-            nContentW = need;
-            barW = nContentW;
-            width = nLeft + nContentW + pad;
-            int y = pad - P(1);
+            pad = P(6); gap = P(10);
+            nSlotW = P(21); nBarW = Math.Max(6, P(10));
+            nHName = P(16); nHAccent = P(6); nHPlan = P(13); nHPct = P(14); nHBar = P(66); nHLabel = P(13);
+            nHReset = showResets ? P(12) : 0;
+            int colH = nHName + nHAccent + nHPlan + nHPct + nHBar + nHLabel + nHReset;
+            int y = pad, right = pad;
             for (int i = 0; i < items.Count; i++)
             {
-                if (i > 0) y += gap;
-                int n = LimitCount(items[i]);
-                int h = nHeadH + (n > 0 ? n * (nLineH + nBarRowH) : P(36));
-                blocks.Add(new Rectangle(0, y, width, h));
-                y += h;
+                bool newRow = i % 2 == 0;
+                if (newRow && i > 0) y += colH + gap;
+                int x = newRow ? pad : blocks[i - 1].Right + gap;
+                int slots = Math.Max(2, LimitCount(items[i]));
+                int w = slots * nSlotW + (slots - 1) * P(2);
+                blocks.Add(new Rectangle(x, y, w, colH));
+                right = Math.Max(right, x + w);
             }
-            height = y + pad - P(2);
+            width = right + pad;
+            height = (items.Count > 0 ? y + colH : y) + pad;
         }
 
         void LayoutStrip(int stripHeight)
@@ -1024,14 +1034,19 @@ namespace UsageTracker
             height = H;
         }
 
+        // The provider block nearest the point (works for rows, columns and the narrow grid).
         public int HitTest(Point p)
         {
+            int best = -1;
+            long bestD = long.MaxValue;
             for (int i = 0; i < blocks.Count; i++)
             {
                 var b = blocks[i];
-                if (mode == ViewMode.Strip ? p.X < b.Right + gap / 2 : p.Y < b.Bottom + gap / 2) return i;
+                long dx = p.X < b.Left ? b.Left - p.X : p.X > b.Right ? p.X - b.Right : 0;
+                long dy = p.Y < b.Top ? b.Top - p.Y : p.Y > b.Bottom ? p.Y - b.Bottom : 0;
+                if (dx * dx + dy * dy < bestD) { bestD = dx * dx + dy * dy; best = i; }
             }
-            return blocks.Count - 1;
+            return best;
         }
 
         // ---- drawing
@@ -1049,8 +1064,9 @@ namespace UsageTracker
                 else if (mode == ViewMode.Narrow) DrawNarrow(g, it, b, faded, now);
                 else DrawWide(g, it, b, faded, now);
 
-                if (i < items.Count - 1)
+                if (i < items.Count - 1 && i + 1 < blocks.Count)
                 {
+                    var next = blocks[i + 1];
                     var old = g.SmoothingMode;
                     g.SmoothingMode = SmoothingMode.None;
                     using (var pen = new Pen(pal.Line, Math.Max(1, P(1))))
@@ -1060,9 +1076,14 @@ namespace UsageTracker
                             int x = b.Right + gap / 2;
                             g.DrawLine(pen, x, sTop + P(3), x, sTop + 2 * rowH - P(3));
                         }
+                        else if (next.Top == b.Top)   // next block sits beside this one (narrow grid)
+                        {
+                            int x = (b.Right + next.Left) / 2;
+                            g.DrawLine(pen, x, b.Top + P(2), x, b.Bottom - P(2));
+                        }
                         else
                         {
-                            int y = b.Bottom + gap / 2;
+                            int y = (b.Bottom + next.Top) / 2;
                             g.DrawLine(pen, pad, y, width - pad, y);
                         }
                     }
@@ -1095,27 +1116,40 @@ namespace UsageTracker
 
         void DrawNarrow(Graphics g, ProviderState it, Rectangle b, bool faded, DateTime now)
         {
-            Accent(g, it, P(3), b.Top + P(2), b.Height - P(4), faded);
-            int x = nLeft;
-            int nameW = W(it.P.Name, fName);
-            string plan = it.Last != null ? it.Last.Plan : null;
-            int planW = string.IsNullOrEmpty(plan) ? 0 : W(plan, fSmall);
-            bool showPlan = planW > 0 && nameW + P(14) + planW <= nContentW;
-            int nameMax = showPlan ? nContentW - planW - P(14) : nContentW - P(10);
-            Txt(g, it.P.Name, fName, new Rectangle(x, b.Top, nameMax, nHeadH), pal.Fade(pal.Text, faded), false, true);
-            Dot(g, it, x + Math.Min(nameW, nameMax) + P(5), b.Top + nHeadH / 2f);
-            if (showPlan) Txt(g, plan, fSmall, new Rectangle(x, b.Top, nContentW, nHeadH), pal.Dim, true, false);
+            int y = b.Top;
+            // name and plan centred over the column; text may spill a little into the gap
+            var wide = new Rectangle(b.Left - P(4), 0, b.Width + P(8), 0);
+            TxtCenter(g, it.P.Name, fName, new Rectangle(wide.X, y, wide.Width, nHName), pal.Fade(pal.Text, faded), true);
+            y += nHName;
 
-            if (!it.HasData) { Message(g, it, new Rectangle(x, b.Top + nHeadH, nContentW, b.Height - nHeadH)); return; }
-            int y = b.Top + nHeadH;
-            foreach (var l in it.Last.Limits)
+            // accent underline, shortened to make room for the status dot when there is one
+            bool dot = it.Busy || it.Warning;
+            float r = Math.Max(2f, 2.5f * S);
+            float lineH = Math.Max(2, P(2));
+            float lineY = y + P(1);
+            float lineW = b.Width - (dot ? r * 2 + P(3) : 0);
+            using (var br = new SolidBrush(pal.Fade(it.P.Accent, faded))) FillRound(g, br, b.Left, lineY, lineW, lineH, lineH / 2f);
+            if (dot)
+                using (var br = new SolidBrush(it.Busy ? pal.Ok : pal.Warn))
+                    g.FillEllipse(br, b.Right - r * 2, lineY + lineH / 2f - r, r * 2, r * 2);
+            y += nHAccent;
+
+            if (it.Last != null && !string.IsNullOrEmpty(it.Last.Plan))
+                TxtCenter(g, it.Last.Plan, fSmall, new Rectangle(wide.X, y, wide.Width, nHPlan), pal.Dim, true);
+            y += nHPlan;
+
+            if (!it.HasData) { Message(g, it, new Rectangle(b.Left - P(3), y, b.Width + P(6), b.Bottom - y), true); return; }
+            for (int j = 0; j < it.Last.Limits.Count; j++)
             {
-                Txt(g, l.Label, fText, new Rectangle(x, y, labelW, nLineH), pal.Fade(pal.Dim, faded), false, false);
+                var l = it.Last.Limits[j];
+                int sx = b.Left + j * (nSlotW + P(2));
+                int tx = sx - P(3), tw = nSlotW + P(6);   // text may use a little of the space between bars
+                TxtCenter(g, Fmt.Pct(l.Percent), fTiny, new Rectangle(tx, y, tw, nHPct), PctColor(l, faded), false);
+                VBar(g, l, sx + (nSlotW - nBarW) / 2f, y + nHPct + P(2), nBarW, nHBar - P(5), faded, now);
+                int ly = y + nHPct + nHBar;
+                TxtCenter(g, l.Label, fTiny, new Rectangle(tx, ly, tw, nHLabel), pal.Fade(pal.Dim, faded), false);
                 if (showResets && l.ResetsAt.HasValue)
-                    Txt(g, Fmt.Short(l.ResetsAt.Value - now), fSmall, new Rectangle(x + labelW + P(5), y, resetW, nLineH), pal.Fade(pal.Dim, faded), false, false);
-                Txt(g, Fmt.Pct(l.Percent), fText, new Rectangle(x + nContentW - pctW, y, pctW, nLineH), PctColor(l, faded), true, false);
-                Bar(g, l, x, y + nLineH + P(1), nContentW, faded, now);
-                y += nLineH + nBarRowH;
+                    TxtCenter(g, Fmt.Tiny(l.ResetsAt.Value - now), fTiny, new Rectangle(tx, ly + nHLabel, tw, nHReset), pal.Fade(pal.Dim, faded), false);
             }
         }
 
@@ -1161,10 +1195,90 @@ namespace UsageTracker
             using (var b = new SolidBrush(it.Busy ? pal.Ok : pal.Warn)) g.FillEllipse(b, cx - r, cy - r, r * 2, r * 2);
         }
 
-        void Message(Graphics g, ProviderState it, Rectangle rc)
+        void Message(Graphics g, ProviderState it, Rectangle rc, bool center = false)
         {
             string msg = it.Error ?? (it.Busy ? "Loading…" : "Waiting…");
-            Para(g, msg, fSmall, rc, it.Error != null ? pal.Warn : pal.Dim);
+            Para(g, msg, fSmall, rc, it.Error != null ? pal.Warn : pal.Dim, center);
+        }
+
+        // Upright bar that fills from the bottom like a level gauge, with a horizontal pace tick.
+        void VBar(Graphics g, Limit l, float x, float y, float w, float h, bool faded, DateTime now)
+        {
+            double pct = Math.Max(0, Math.Min(100, l.Percent));
+            using (var b = new SolidBrush(pal.Track)) FillRound(g, b, x, y, w, h, w / 2f);
+            float fh = (float)(h * pct / 100.0);
+            if (pct > 0 && fh < P(2)) fh = P(2);
+            if (fh > 0)
+                using (var b = new SolidBrush(pal.Fade(pal.For(l.Percent), faded)))
+                using (var path = LevelPath(x, y, w, h, fh))
+                    g.FillPath(b, path);
+            if (l.ResetsAt.HasValue && l.WindowMinutes > 0)
+            {
+                double frac = 1 - (l.ResetsAt.Value - now).TotalMinutes / l.WindowMinutes;
+                if (frac > 0 && frac < 1)
+                {
+                    float py = y + h - (float)(h * frac);
+                    float th = Math.Max(1f, 1.5f * S);
+                    using (var b = new SolidBrush(Color.FromArgb(faded ? 90 : 190, pal.Text)))
+                        g.FillRectangle(b, x - P(2.5f), py - th / 2f, w + P(5), th);
+                }
+            }
+        }
+
+        // The part of a capsule (x, y, w, h, fully rounded ends) below a fill level fh from the bottom,
+        // so a low reading is a sliver that follows the rounded bottom instead of a full rounded cap.
+        static GraphicsPath LevelPath(float x, float y, float w, float h, float fh)
+        {
+            var p = new GraphicsPath();
+            float r = w / 2f, cx = x + r;
+            float cyb = y + h - r, cyt = y + r;   // centres of the bottom and top end circles
+            float level = y + h - Math.Min(fh, h);
+            if (level >= cyb)
+            {
+                // inside the bottom cap: a circular segment under the chord at `level`
+                float dy = level - cyb;
+                double a = Math.Asin(Math.Min(1, dy / r)) * 180 / Math.PI;   // angle of the chord's right end
+                p.AddArc(cx - r, cyb - r, 2 * r, 2 * r, (float)a, (float)(180 - 2 * a));
+                p.CloseFigure();
+                return p;
+            }
+            p.AddArc(cx - r, cyb - r, 2 * r, 2 * r, 0, 180);   // the whole bottom cap
+            if (level >= cyt)
+            {
+                p.AddLine(x, cyb, x, level);
+                p.AddLine(x, level, x + w, level);
+            }
+            else
+            {
+                // into the top cap: follow it up to the chord at `level`
+                p.AddLine(x, cyb, x, cyt);
+                double a = Math.Asin(Math.Min(1, (cyt - level) / r)) * 180 / Math.PI;
+                p.AddArc(cx - r, cyt - r, 2 * r, 2 * r, 180, (float)a);
+                p.AddArc(cx - r, cyt - r, 2 * r, 2 * r, (float)(360 - a), (float)a);
+            }
+            p.CloseFigure();
+            return p;
+        }
+
+        void TxtCenter(Graphics g, string s, Font f, Rectangle rc, Color c, bool ellipsis)
+        {
+            if (string.IsNullOrEmpty(s) || rc.Width <= 0) return;
+            if (pal.Transparent)
+            {
+                using (var sf = (StringFormat)StringFormat.GenericTypographic.Clone())
+                using (var b = new SolidBrush(c))
+                {
+                    sf.FormatFlags = (sf.FormatFlags | StringFormatFlags.NoWrap) & ~StringFormatFlags.NoClip;
+                    sf.Alignment = StringAlignment.Center;
+                    sf.LineAlignment = StringAlignment.Center;
+                    sf.Trimming = ellipsis ? StringTrimming.EllipsisCharacter : StringTrimming.None;
+                    g.DrawString(s, f, b, rc, sf);
+                }
+                return;
+            }
+            var flags = TF | TextFormatFlags.HorizontalCenter;
+            if (ellipsis) flags |= TextFormatFlags.EndEllipsis;
+            TextRenderer.DrawText(g, s, f, rc, c, flags);
         }
 
         // Usage bar with a pace tick showing how much of the window's time has gone by.
@@ -1212,7 +1326,7 @@ namespace UsageTracker
             TextRenderer.DrawText(g, s, f, rc, c, flags);
         }
 
-        void Para(Graphics g, string s, Font f, Rectangle rc, Color c)
+        void Para(Graphics g, string s, Font f, Rectangle rc, Color c, bool center)
         {
             if (string.IsNullOrEmpty(s) || rc.Width <= 0) return;
             if (pal.Transparent)
@@ -1223,6 +1337,7 @@ namespace UsageTracker
                 using (var sf = new StringFormat())
                 using (var b = new SolidBrush(c))
                 {
+                    sf.Alignment = center ? StringAlignment.Center : StringAlignment.Near;
                     sf.LineAlignment = StringAlignment.Center;
                     sf.Trimming = StringTrimming.EllipsisWord;
                     g.DrawString(s, f, b, rc, sf);
@@ -1230,9 +1345,10 @@ namespace UsageTracker
                 g.TextRenderingHint = oldHint;
                 return;
             }
-            TextRenderer.DrawText(g, s, f, rc, c,
-                TextFormatFlags.NoPadding | TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter |
-                TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            var flags = TextFormatFlags.NoPadding | TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter |
+                        TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+            if (center) flags |= TextFormatFlags.HorizontalCenter;
+            TextRenderer.DrawText(g, s, f, rc, c, flags);
         }
 
         static void FillRound(Graphics g, Brush b, float x, float y, float w, float h, float r)
@@ -1259,6 +1375,7 @@ namespace UsageTracker
             fName.Dispose();
             fText.Dispose();
             fSmall.Dispose();
+            fTiny.Dispose();
         }
     }
 

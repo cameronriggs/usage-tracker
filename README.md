@@ -53,7 +53,7 @@ Claude, and the Codex CLI or VS Code extension for Codex.
 | Layout | Shape | Good for |
 | --- | --- | --- |
 | Wide | One row per limit, providers stacked (about 290 x 95) | A corner of the desktop |
-| Narrow | A thin column, each limit a text line over a full-width bar (about 108 px wide) | The gap beside a browser or the desktop icons |
+| Narrow | Providers side by side as columns of upright bars that fill from the bottom, two providers per row (about 110 x 152) | The gap beside a browser or the desktop icons |
 | In the taskbar | Providers side by side, two rows high, transparent background | A taskbar with spare room, like a second monitor's |
 
 Wide and Narrow remember their own positions, so switching back and forth
@@ -73,8 +73,10 @@ In the taskbar:
 
 - Fill is the share of the limit used. Blue under 70%, amber 70 to 89%, red 90%+.
 - The thin tick is how much of the window's *time* has passed. Fill past the
-  tick means you're burning faster than the limit allows on average.
-- The right column counts down to the reset.
+  tick means you're burning faster than the limit allows on average. (In
+  Narrow the bars stand up, so the tick is a short horizontal line.)
+- The countdown shows time to the reset. Narrow rounds it down to fit under a
+  bar ("3h", "39h", "5d"); hover for the exact time.
 - An amber dot after a name means the last check failed and you're seeing the
   previous numbers (hover to see why and when it retries). After 15 minutes
   without fresh numbers, that provider is dimmed. A blue dot means it's checking.
