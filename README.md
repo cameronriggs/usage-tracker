@@ -111,7 +111,7 @@ and optional `"enabled": false` to hide it without deleting it.
 
 | type | Where the numbers come from | Extra options |
 | --- | --- | --- |
-| `claude` | Claude Code's login (`~/.claude/.credentials.json`) and Anthropic's usage endpoint, the same data `/usage` shows. Covers claude.ai and Claude Code, since they share limits. | `credentials`: path to another account's `.credentials.json` |
+| `claude` | Claude Code's login (`~/.claude/.credentials.json`) and Anthropic's usage endpoint, the same data `/usage` shows. Covers claude.ai and Claude Code, since they share limits. | `credentials`: path to another account's `.credentials.json`. `usageFile`: also save the numbers to this JSON file (see below) |
 | `codex` | Runs `codex app-server` and asks it for `account/rateLimits/read`. These are your ChatGPT plan's Codex limits. Finds Codex in the VS Code extension, or on PATH. | `codexPath`: a specific `codex.exe`. `codexHome`: a different `CODEX_HOME` (second account) |
 | `command` | Any command that prints JSON. Use it for agents without built-in support. | `command`: run with `cmd /c`, from this folder |
 
@@ -130,6 +130,29 @@ A `command` must print:
 `resetsAt` is ISO 8601 or unix seconds. `windowMinutes` sets the label (300 is
 `5h`, 10080 is `wk`) and the pace tick; `"label": "mo"` overrides the label.
 Print `{"error": "message"}` to show a message instead.
+
+### Sharing Claude's numbers with other tools (`usageFile`)
+
+Set `"usageFile": "~/.claude/usage.json"` on a `claude` provider and the widget
+saves the numbers there after every good check, with no extra calls to
+Anthropic. Scripts and Claude Code hooks can read it, for example to stop
+starting agents when the 5-hour limit is nearly used. The fields match Claude
+Code's status line `rate_limits`:
+
+```json
+{
+  "updated_at": "2026-11-16T18:10:56.677Z",
+  "updated_at_epoch": 1794852656,
+  "updated_at_local": "2026-11-16 12:10",
+  "source": "usage-tracker",
+  "five_hour": { "used_percentage": 42, "resets_at": 1794856956, "resets_at_local": "2026-11-16 13:22" },
+  "seven_day": { "used_percentage": 18, "resets_at": 1795152656, "resets_at_local": "2026-11-19 23:30" }
+}
+```
+
+`resets_at` is unix seconds and the `_local` fields are your PC's time. A window
+Anthropic didn't report is `null`. Failed checks leave the file alone, so
+`updated_at` tells you how fresh it is.
 
 ## Privacy and safety
 

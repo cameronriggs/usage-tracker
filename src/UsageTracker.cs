@@ -27,8 +27,8 @@ using Microsoft.Win32;
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 [assembly: AssemblyTitle("Usage Tracker")]
 [assembly: AssemblyProduct("Usage Tracker")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
 
 namespace UsageTracker
 {
@@ -387,6 +387,64 @@ namespace UsageTracker
         }
     }
 
+    // Optional (claude provider, config "usageFile"): after each good check, writes the numbers to a
+    // JSON file in the shape of Claude Code's status line rate_limits, so scripts and hooks (such as a
+    // Claude Code usage guard) can read them without calling Anthropic's endpoint again:
+    //   { "updated_at": "...Z", "updated_at_epoch": 1794850000, "updated_at_local": "2026-11-16 12:10",
+    //     "source": "usage-tracker",
+    //     "five_hour": { "used_percentage": 42, "resets_at": 1794856956, "resets_at_local": "..." },
+    //     "seven_day": { ... } }
+    // A window Anthropic didn't report is written as null.
+    static class UsageFile
+    {
+        const string LocalFormat = "yyyy-MM-dd HH:mm";
+
+        public static void Write(string path, Snapshot s)
+        {
+            var now = DateTime.UtcNow;
+            var d = new Dictionary<string, object>();
+            d["updated_at"] = now.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
+            d["updated_at_epoch"] = (long)(now - Json.Epoch).TotalSeconds;
+            d["updated_at_local"] = now.ToLocalTime().ToString(LocalFormat, CultureInfo.InvariantCulture);
+            d["source"] = "usage-tracker";
+            d["five_hour"] = Window(s, 300);
+            d["seven_day"] = Window(s, 10080);
+            string json = new JavaScriptSerializer().Serialize(d) + "\n";
+
+            string dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            // Write a temp file and swap it in, so a reader never sees half a file.
+            string tmp = path + "." + Process.GetCurrentProcess().Id + ".tmp";
+            File.WriteAllText(tmp, json, new UTF8Encoding(false));
+            try
+            {
+                if (File.Exists(path)) File.Replace(tmp, path, null);
+                else File.Move(tmp, path);
+            }
+            catch (Exception)
+            {
+                // Swap refused (file busy): fall back to a plain overwrite.
+                try { File.WriteAllText(path, json, new UTF8Encoding(false)); }
+                finally { try { File.Delete(tmp); } catch { } }
+            }
+        }
+
+        static object Window(Snapshot s, double minutes)
+        {
+            var l = s.Limits.FirstOrDefault(x => Math.Abs(x.WindowMinutes - minutes) < 1);
+            if (l == null) return null;
+            var w = new Dictionary<string, object>();
+            w["used_percentage"] = Math.Round(l.Percent, 1);
+            if (l.ResetsAt.HasValue)
+            {
+                w["resets_at"] = (long)(l.ResetsAt.Value - Json.Epoch).TotalSeconds;
+                w["resets_at_local"] = l.ResetsAt.Value.ToLocalTime().ToString(LocalFormat, CultureInfo.InvariantCulture);
+            }
+            else w["resets_at"] = null;
+            return w;
+        }
+    }
+
     // ------------------------------------------------------------------ providers
 
     // Claude (Pro/Max): reads Claude Code's OAuth login and asks the same usage endpoint /usage uses.
@@ -396,11 +454,13 @@ namespace UsageTracker
         const string Url = "https://api.anthropic.com/api/oauth/usage";
         const string Expired = "Login expired: open Claude Code to renew it";
         readonly string credPath;
+        readonly string usageFile;
 
-        public ClaudeProvider(string name, string credentials)
+        public ClaudeProvider(string name, string credentials, string usageFile)
         {
             Name = name;
             credPath = credentials;
+            this.usageFile = usageFile;
             Accent = Color.FromArgb(217, 119, 87);
         }
 
@@ -451,6 +511,12 @@ namespace UsageTracker
             Add(s, o, "five_hour", 300);
             Add(s, o, "seven_day", 10080);
             if (s.Limits.Count == 0) throw new FetchException("No usage data in Anthropic's reply");
+            if (!string.IsNullOrEmpty(usageFile))
+            {
+                // Never let a file problem hide the numbers in the widget.
+                try { UsageFile.Write(Paths.Expand(usageFile), s); }
+                catch (Exception ex) { Paths.Log(Name + ": can't write usageFile: " + ex.Message); }
+            }
             return s;
         }
 
@@ -749,7 +815,7 @@ namespace UsageTracker
             string type = (Json.Str(o, "type") ?? "").Trim().ToLowerInvariant();
             string name = Json.Str(o, "name");
             Provider p;
-            if (type == "claude") p = new ClaudeProvider(name ?? "Claude", Json.Str(o, "credentials"));
+            if (type == "claude") p = new ClaudeProvider(name ?? "Claude", Json.Str(o, "credentials"), Json.Str(o, "usageFile"));
             else if (type == "codex" || type == "chatgpt") p = new CodexProvider(name ?? "Codex", Json.Str(o, "codexPath"), Json.Str(o, "codexHome"));
             else if (type == "command") p = new CommandProvider(name ?? "Agent", Json.Str(o, "command"));
             else p = new BrokenProvider(name ?? (type.Length > 0 ? type : "?"), "Unknown provider type \"" + type + "\"");
