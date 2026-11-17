@@ -1,6 +1,7 @@
 # Usage Tracker
 
-Tiny Windows widget showing 5-hour and weekly AI usage limits. Public repo
+Tiny Windows widget showing weekly AI usage limits, plus a 5-hour bar where a
+provider has one. Public repo
 `cameronriggs/usage-tracker`. Read `README.md` for what it does and how config works.
 
 ## Working on it
