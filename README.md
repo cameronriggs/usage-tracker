@@ -111,7 +111,7 @@ and optional `"enabled": false` to hide it without deleting it.
 
 | type | Where the numbers come from | Extra options |
 | --- | --- | --- |
-| `claude` | Claude Code's login (`~/.claude/.credentials.json`) and Anthropic's usage endpoint, the same data `/usage` shows. Covers claude.ai and Claude Code, since they share limits. | `credentials`: path to another account's `.credentials.json`. `usageFile`: also save the numbers to this JSON file (see below) |
+| `claude` | Claude Code's login (`~/.claude/.credentials.json`) and Anthropic's usage endpoint, the same data `/usage` shows. Covers claude.ai and Claude Code, since they share limits. A weekly limit on one model (such as Fable) gets its own row, labeled with the model's name. | `credentials`: path to another account's `.credentials.json`. `usageFile`: also save the numbers to this JSON file (see below) |
 | `codex` | Runs `codex app-server` and asks it for `account/rateLimits/read`. These are your ChatGPT plan's Codex limits. Finds Codex in the VS Code extension, or on PATH. | `codexPath`: a specific `codex.exe`. `codexHome`: a different `CODEX_HOME` (second account) |
 | `command` | Any command that prints JSON. Use it for agents without built-in support. | `command`: run with `cmd /c`, from this folder |
 

@@ -27,8 +27,8 @@ using Microsoft.Win32;
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 [assembly: AssemblyTitle("Usage Tracker")]
 [assembly: AssemblyProduct("Usage Tracker")]
-[assembly: AssemblyVersion("1.3.0.0")]
-[assembly: AssemblyFileVersion("1.3.0.0")]
+[assembly: AssemblyVersion("1.4.0.0")]
+[assembly: AssemblyFileVersion("1.4.0.0")]
 
 namespace UsageTracker
 {
@@ -286,6 +286,26 @@ namespace UsageTracker
         public double Percent;      // 0-100, share of the limit used
         public DateTime? ResetsAt;  // UTC
         public double WindowMinutes;
+        public string Model;        // set for a limit on one model only ("Fable"), null for all models
+
+        // A limit that counts only one model's use, e.g. Claude's weekly Fable limit.
+        public static Limit ForModel(string model, double minutes, double percent, DateTime? resetsAt)
+        {
+            var l = Make(minutes, percent, resetsAt, model);
+            l.Model = model;
+            l.LongLabel = LongLabelFor(minutes) + " (" + model + ")";
+            return l;
+        }
+
+        // Shortest window first; all-model limits before single-model ones of the same window.
+        public static int Order(Limit a, Limit b)
+        {
+            int c = a.WindowMinutes.CompareTo(b.WindowMinutes);
+            if (c != 0) return c;
+            c = (a.Model == null ? 0 : 1).CompareTo(b.Model == null ? 0 : 1);
+            if (c != 0) return c;
+            return string.Compare(a.Model, b.Model, StringComparison.OrdinalIgnoreCase);
+        }
 
         public static Limit Make(double minutes, double percent, DateTime? resetsAt, string label)
         {
@@ -379,7 +399,7 @@ namespace UsageTracker
             {
                 res.Snap = p.Fetch();
                 res.Snap.FetchedAt = DateTime.UtcNow;
-                res.Snap.Limits.Sort((a, b) => a.WindowMinutes.CompareTo(b.WindowMinutes));
+                res.Snap.Limits.Sort(Limit.Order);
             }
             catch (FetchException fe) { res.Error = fe.Message; res.RateLimited = fe.RateLimited; res.RetryAfter = fe.RetryAfter; }
             catch (Exception ex) { res.Error = ex.GetType().Name + ": " + ex.Message; Paths.Log(p.Name + ": " + ex); }
@@ -431,7 +451,7 @@ namespace UsageTracker
 
         static object Window(Snapshot s, double minutes)
         {
-            var l = s.Limits.FirstOrDefault(x => Math.Abs(x.WindowMinutes - minutes) < 1);
+            var l = s.Limits.FirstOrDefault(x => x.Model == null && Math.Abs(x.WindowMinutes - minutes) < 1);
             if (l == null) return null;
             var w = new Dictionary<string, object>();
             w["used_percentage"] = Math.Round(l.Percent, 1);
@@ -510,6 +530,7 @@ namespace UsageTracker
             s.Plan = PlanName(Json.Str(root, "claudeAiOauth", "subscriptionType"), Json.Str(root, "claudeAiOauth", "rateLimitTier"));
             Add(s, o, "five_hour", 300);
             Add(s, o, "seven_day", 10080);
+            AddModels(s, o);
             if (s.Limits.Count == 0) throw new FetchException("No usage data in Anthropic's reply");
             if (!string.IsNullOrEmpty(usageFile))
             {
@@ -527,6 +548,25 @@ namespace UsageTracker
             double? used = Json.Num(w, "utilization");
             if (!used.HasValue) return;
             s.Limits.Add(Limit.Make(minutes, used.Value, Json.Time(Json.Get(w, "resets_at")), null));
+        }
+
+        // Weekly limits on one model (Fable on some plans) come in a "limits" list:
+        //   { "kind": "weekly_scoped", "scope": { "model": { "display_name": "Fable" } },
+        //     "percent": 12, "resets_at": "..." }
+        // Claude Code's /usage reads the same entries.
+        static void AddModels(Snapshot s, object o)
+        {
+            var list = Json.List(o, "limits");
+            if (list == null) return;
+            foreach (var e in list)
+            {
+                if (Json.Str(e, "kind") != "weekly_scoped") continue;
+                string model = Json.Str(e, "scope", "model", "display_name");
+                double? used = Json.Num(e, "percent");
+                if (string.IsNullOrEmpty(model) || !used.HasValue) continue;
+                if (s.Limits.Any(x => string.Equals(x.Model, model, StringComparison.OrdinalIgnoreCase))) continue;
+                s.Limits.Add(Limit.ForModel(model, 10080, used.Value, Json.Time(Json.Get(e, "resets_at"))));
+            }
         }
 
         static string PlanName(string sub, string tier)
@@ -961,7 +1001,7 @@ namespace UsageTracker
         int pad, gap, rowH, barW, width, height;
         int xName, nameColW, xLabel, xBar, xPct, xReset;       // wide
         int nSlotW, nBarW, nHName, nHAccent, nHPlan, nHPct, nHBar, nHLabel, nHReset;   // narrow
-        int sTop;                                               // strip
+        int sTop, sDataW, sColGap;                              // strip
         readonly List<int> sNameW = new List<int>();
 
         public Renderer(float scale, ViewMode mode, bool showResets, Palette pal, int stripHeight, IList<ProviderState> items)
@@ -1022,6 +1062,9 @@ namespace UsageTracker
 
         static int LimitCount(ProviderState it) { return it.HasData ? it.Last.Limits.Count : 0; }
 
+        // The strip is two rows high, so a third limit (5h, wk and a model's own weekly) starts a column.
+        static int StripCols(ProviderState it) { return Math.Max(1, (LimitCount(it) + 1) / 2); }
+
         // ---- layout
 
         void LayoutWide()
@@ -1077,12 +1120,12 @@ namespace UsageTracker
 
         void LayoutStrip(int stripHeight)
         {
-            pad = P(6); gap = P(16);
+            pad = P(6); gap = P(16); sColGap = P(12);
             int H = stripHeight > 0 ? stripHeight : P(44);
             rowH = Math.Min(P(17), (H - P(4)) / 2);
             sTop = (H - 2 * rowH) / 2;
             barW = P(64);
-            int dataW = labelW + P(5) + barW + P(6) + pctW + (showResets ? P(8) + resetW : 0);
+            sDataW = labelW + P(5) + barW + P(6) + pctW + (showResets ? P(8) + resetW : 0);
             int x = pad;
             for (int i = 0; i < items.Count; i++)
             {
@@ -1092,7 +1135,8 @@ namespace UsageTracker
                 if (it.Last != null && it.Last.Plan != null) nw = Math.Max(nw, W(it.Last.Plan, fSmall));
                 nw = Math.Min(nw, P(110));
                 sNameW.Add(nw);
-                int bw = accentW + P(6) + nw + P(8) + dataW;
+                int cols = StripCols(it);
+                int bw = accentW + P(6) + nw + P(8) + cols * sDataW + (cols - 1) * sColGap;
                 blocks.Add(new Rectangle(x, 0, bw, H));
                 x += bw;
             }
@@ -1231,12 +1275,13 @@ namespace UsageTracker
 
             int xl = xn + nw + P(8);
             if (!it.HasData) { Message(g, it, new Rectangle(xl, sTop, b.Right - xl, 2 * rowH)); return; }
-            int xb = xl + labelW + P(5), xp = xb + barW + P(6), xr = xp + pctW + P(8);
-            for (int j = 0; j < it.Last.Limits.Count && j < 2; j++)
+            for (int j = 0; j < it.Last.Limits.Count; j++)
             {
                 var l = it.Last.Limits[j];
-                int y = sTop + j * rowH;
-                Txt(g, l.Label, fText, new Rectangle(xl, y, labelW + P(5), rowH), pal.Fade(pal.Dim, faded), false, false);
+                int y = sTop + (j % 2) * rowH;
+                int xc = xl + (j / 2) * (sDataW + sColGap);
+                int xb = xc + labelW + P(5), xp = xb + barW + P(6), xr = xp + pctW + P(8);
+                Txt(g, l.Label, fText, new Rectangle(xc, y, labelW + P(5), rowH), pal.Fade(pal.Dim, faded), false, false);
                 Bar(g, l, xb, y + (rowH - barH) / 2f, barW, faded, now);
                 Txt(g, Fmt.Pct(l.Percent), fText, new Rectangle(xp, y, pctW, rowH), PctColor(l, faded), true, false);
                 if (showResets && l.ResetsAt.HasValue)
@@ -2393,6 +2438,7 @@ namespace UsageTracker
             var a = mk("Claude", Color.FromArgb(217, 119, 87), "Max 5x");
             a.Last.Limits.Add(Limit.Make(300, 42, now.AddMinutes(133), null));
             a.Last.Limits.Add(Limit.Make(10080, 18, now.AddHours(100), null));
+            a.Last.Limits.Add(Limit.ForModel("Fable", 10080, 31, now.AddHours(100)));
             var b = mk("Codex", Color.FromArgb(16, 163, 127), "Team");
             b.Last.Limits.Add(Limit.Make(300, 76, now.AddMinutes(41), null));
             b.Last.Limits.Add(Limit.Make(10080, 93, now.AddHours(30), null));
